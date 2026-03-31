@@ -273,7 +273,7 @@ class SyncCache(ChunkCache):
         kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :evict_len]
         self.token_to_kv_pool_allocator.free(kv_indices)
 
-    def evict_device(self, req: Req, seq_len: int) -> None:
+    def evict_device(self, req: Req, seq_len: Optional[int] = None) -> None:
         with self._lock:
             self._drain_write_acks()
             entry = self.entries.get(req.rid)
@@ -281,7 +281,8 @@ class SyncCache(ChunkCache):
                 return
             # Push all remaining unsynced tokens to write queue first.
             self._write_through_req(req, force=True)
-            target = min(seq_len, self._infer_seq_len(req))
+            inferred_seq_len: int = self._infer_seq_len(req)
+            target = min(seq_len, inferred_seq_len) if seq_len is not None else inferred_seq_len
             if target <= 0:
                 return
 

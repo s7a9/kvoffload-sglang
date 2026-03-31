@@ -2198,6 +2198,9 @@ class Scheduler(
             chunked_req_to_exclude.add(self.chunked_req)
             self.stash_chunked_request(self.chunked_req)
 
+        if self.last_batch and hasattr(self.tree_cache, "sync_batch"):
+            self.tree_cache.sync_batch(self.last_batch)
+
         if self.enable_hisparse:
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
@@ -2209,8 +2212,6 @@ class Scheduler(
                 self.running_batch.hisparse_coordinator = self.hisparse_coordinator
         else:
             if self.last_batch and self.last_batch.forward_mode.is_extend():
-                if hasattr(self.tree_cache, "sync_batch"):
-                    self.tree_cache.sync_batch(self.last_batch)
                 if self.last_batch.chunked_req is not None:
                     # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                     # We need to discard it.
@@ -2441,8 +2442,9 @@ class Scheduler(
             moved_from_running = len(remove_indices)
             # Release KV for removed running requests before filtering them out.
             for remove_ct, idx in enumerate(sorted(remove_indices, reverse=True)):
-                remaining_req_count = len(running_reqs) - remove_ct - 1
-                self.running_batch.release_req(idx, remaining_req_count, self.server_args)
+                req: Req = running_reqs[idx]
+                self.tree_cache.evict_device(req)
+                req.reset_for_retract()
 
             if keep_indices:
                 self.running_batch.filter_batch(keep_indices=keep_indices)
