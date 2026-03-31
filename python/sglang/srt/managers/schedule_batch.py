@@ -1964,6 +1964,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         release_kv_cache(req, self.tree_cache, is_insert=False)
         # NOTE(lsyin): we should use the newly evictable memory instantly.
         num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
+        if hasattr(self.tree_cache, "evict_nowait") and num_tokens > 0:
+            self.tree_cache.evict_nowait([req], num_tokens)
         evict_from_tree_cache(self.tree_cache, num_tokens)
 
         req.reset_for_retract()

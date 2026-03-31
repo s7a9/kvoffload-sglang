@@ -21,6 +21,7 @@ import importlib
 import importlib.util
 import json
 import logging
+import math
 import os
 import random
 import tempfile
@@ -175,6 +176,8 @@ NSA_CHOICES = [
 ]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
+
+KV_OFFLOAD_POLICY_CHOICES = ["default", "paper_v1"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -561,6 +564,22 @@ class ServerArgs:
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
 
+    # KV offload policy (paper strategy)
+    kv_offload_policy: str = "default"
+    kv_offload_reschedule_interval: int = 2
+    kv_offload_token_value_alpha: float = 1.0
+    kv_offload_load_cost_beta: float = 1e-3
+    kv_offload_evict_cost_gamma: float = 1.0
+    kv_offload_recompute_cost_delta: float = 1.0
+    kv_offload_enable_local_search: bool = False
+    kv_offload_default_output_speed: float = 5.0
+    kv_offload_buffer_conservativeness: float = 2.0
+    kv_offload_enable_emergency_eviction: bool = False
+    kv_offload_emergency_min_evict_tokens: int = 256
+    kv_offload_emergency_decode_retry: int = 1
+    kv_offload_emergency_prefill_retry: int = 1
+    kv_offload_emergency_trigger_ratio: float = 0.05
+
     # Hierarchical sparse attention
     enable_hisparse: bool = False
     hisparse_config: Optional[str] = None
@@ -792,6 +811,7 @@ class ServerArgs:
 
         # Handle Hicache settings.
         self._handle_hicache()
+        self._handle_kv_offload_policy()
 
         # Handle data parallelism.
         self._handle_data_parallelism()
@@ -3312,6 +3332,68 @@ class ServerArgs:
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
+    def _handle_kv_offload_policy(self):
+        if self.kv_offload_policy not in KV_OFFLOAD_POLICY_CHOICES:
+            raise ValueError(
+                f"Invalid kv_offload_policy={self.kv_offload_policy!r}. "
+                f"Expected one of {KV_OFFLOAD_POLICY_CHOICES}."
+            )
+
+        if self.kv_offload_reschedule_interval <= 0:
+            raise ValueError(
+                "--kv-offload-reschedule-interval must be a positive integer."
+            )
+
+        coefficient_specs = [
+            ("--kv-offload-token-value-alpha", self.kv_offload_token_value_alpha),
+            ("--kv-offload-load-cost-beta", self.kv_offload_load_cost_beta),
+            ("--kv-offload-evict-cost-gamma", self.kv_offload_evict_cost_gamma),
+            (
+                "--kv-offload-recompute-cost-delta",
+                self.kv_offload_recompute_cost_delta,
+            ),
+        ]
+        for name, value in coefficient_specs:
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be a non-negative finite float.")
+
+        if (
+            not math.isfinite(self.kv_offload_default_output_speed)
+            or self.kv_offload_default_output_speed <= 0
+        ):
+            raise ValueError(
+                "--kv-offload-default-output-speed must be a positive finite float."
+            )
+
+        if (
+            not math.isfinite(self.kv_offload_buffer_conservativeness)
+            or self.kv_offload_buffer_conservativeness <= 0
+        ):
+            raise ValueError(
+                "--kv-offload-buffer-conservativeness must be a positive finite float."
+            )
+
+        if self.kv_offload_policy != "default" and self.disaggregation_mode != "null":
+            raise ValueError(
+                "--kv-offload-policy=paper_v1 is not compatible with PD disaggregation "
+                "(--disaggregation-mode must be null)."
+            )
+
+        logger.info(
+            "Effective KV offload policy config: "
+            "policy=%s, reschedule_interval=%d, alpha=%s, beta=%s, gamma=%s, delta=%s, "
+            "default_output_speed=%s, buffer_conservativeness=%s, local_search=%s",
+            self.kv_offload_policy,
+            self.kv_offload_reschedule_interval,
+            self.kv_offload_token_value_alpha,
+            self.kv_offload_load_cost_beta,
+            self.kv_offload_evict_cost_gamma,
+            self.kv_offload_recompute_cost_delta,
+            self.kv_offload_default_output_speed,
+            self.kv_offload_buffer_conservativeness,
+            self.kv_offload_enable_local_search,
+        )
+
     def _handle_deterministic_inference(self):
         if self.rl_on_policy_target is not None:
             logger.warning(
@@ -5070,6 +5152,93 @@ class ServerArgs:
             type=str,
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
+        )
+
+        # KV offload policy (paper strategy)
+        parser.add_argument(
+            "--kv-offload-policy",
+            type=str,
+            choices=KV_OFFLOAD_POLICY_CHOICES,
+            default=ServerArgs.kv_offload_policy,
+            help="KV offload scheduling strategy. 'default' keeps current behavior; 'paper_v1' enables the staged paper policy path.",
+        )
+        parser.add_argument(
+            "--kv-offload-reschedule-interval",
+            type=int,
+            default=ServerArgs.kv_offload_reschedule_interval,
+            help="Reschedule interval (in seconds) for kv_offload_policy=paper_v1.",
+        )
+        parser.add_argument(
+            "--kv-offload-token-value-alpha",
+            type=float,
+            default=ServerArgs.kv_offload_token_value_alpha,
+            help="Token-value objective weight alpha for kv_offload_policy=paper_v1.",
+        )
+        parser.add_argument(
+            "--kv-offload-load-cost-beta",
+            type=float,
+            default=ServerArgs.kv_offload_load_cost_beta,
+            help="Load-cost objective weight beta for kv_offload_policy=paper_v1.",
+        )
+        parser.add_argument(
+            "--kv-offload-evict-cost-gamma",
+            type=float,
+            default=ServerArgs.kv_offload_evict_cost_gamma,
+            help="Evict-cost objective weight gamma for kv_offload_policy=paper_v1.",
+        )
+        parser.add_argument(
+            "--kv-offload-recompute-cost-delta",
+            type=float,
+            default=ServerArgs.kv_offload_recompute_cost_delta,
+            help="Recompute-cost objective weight delta for kv_offload_policy=paper_v1.",
+        )
+        parser.add_argument(
+            "--kv-offload-enable-local-search",
+            action="store_true",
+            default=ServerArgs.kv_offload_enable_local_search,
+            help="Enable local-search refinement for kv_offload_policy=paper_v1.",
+        )
+        parser.add_argument(
+            "--kv-offload-default-output-speed",
+            type=float,
+            default=ServerArgs.kv_offload_default_output_speed,
+            help="Fallback playback/consumption speed (tokens/s) used by request-buffer scheduling when request-level speed is not provided.",
+        )
+        parser.add_argument(
+            "--kv-offload-buffer-conservativeness",
+            type=float,
+            default=ServerArgs.kv_offload_buffer_conservativeness,
+            help="IBT safety multiplier for swapping out running requests in request-buffer scheduling.",
+        )
+        parser.add_argument(
+            "--kv-offload-enable-emergency-eviction",
+            action="store_true",
+            default=ServerArgs.kv_offload_enable_emergency_eviction,
+            help="Enable emergency eviction fallback on decode/prefill memory pressure.",
+        )
+        parser.add_argument(
+            "--kv-offload-emergency-min-evict-tokens",
+            type=int,
+            default=ServerArgs.kv_offload_emergency_min_evict_tokens,
+            help="Minimum tokens to free in one emergency eviction attempt.",
+        )
+        parser.add_argument(
+            "--kv-offload-emergency-decode-retry",
+            type=int,
+            default=ServerArgs.kv_offload_emergency_decode_retry,
+            help="Maximum emergency eviction retries for decode before normal fallback.",
+        )
+        parser.add_argument(
+            "--kv-offload-emergency-prefill-retry",
+            type=int,
+            default=ServerArgs.kv_offload_emergency_prefill_retry,
+            help="Maximum emergency eviction retries for prefill admission.",
+        )
+        parser.add_argument(
+            "--kv-offload-emergency-trigger-ratio",
+            type=float,
+            default=ServerArgs.kv_offload_emergency_trigger_ratio,
+            help="Emergency path trigger threshold on available token ratio.",
         )
 
         # Hierarchical sparse attention

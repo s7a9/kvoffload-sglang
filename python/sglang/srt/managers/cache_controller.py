@@ -17,7 +17,7 @@ import logging
 import threading
 import time
 from queue import Empty, Full, Queue
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Set, Tuple
 
 import torch
 
@@ -318,6 +318,18 @@ class HiCacheController:
 
         self.write_stream = device_module.Stream()
         self.load_stream = device_module.Stream()
+
+        # Workload snapshot states (Stage 05): keep lightweight metadata for
+        # queue depth/backlog and short-window throughput estimation.
+        self._workload_lock = threading.Lock()
+        self._write_ack_tokens_by_event: Dict[int, int] = {}
+        self._load_ack_tokens_by_event: Dict[int, int] = {}
+        self._write_nodes_by_event: Dict[int, Set[str]] = {}
+        self._seen_finished_write_events: Set[int] = set()
+        self._seen_finished_load_events: Set[int] = set()
+        self._running_write_speed_tokens_per_s: float = 0.0
+        self._running_load_speed_tokens_per_s: float = 0.0
+        self._last_workload_update_ts: float = time.monotonic()
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -630,6 +642,15 @@ class HiCacheController:
         self.load_buffer.clear()
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
+        with self._workload_lock:
+            self._write_ack_tokens_by_event.clear()
+            self._load_ack_tokens_by_event.clear()
+            self._write_nodes_by_event.clear()
+            self._seen_finished_write_events.clear()
+            self._seen_finished_load_events.clear()
+            self._running_write_speed_tokens_per_s = 0.0
+            self._running_load_speed_tokens_per_s = 0.0
+            self._last_workload_update_ts = time.monotonic()
         if self.enable_storage:
             self.prefetch_thread.join()
             self.backup_thread.join()
@@ -696,6 +717,7 @@ class HiCacheController:
                 device_indices.record_stream(self.write_stream)
 
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+        self._register_write_ack(finish_event, op)
 
     def load(
         self,
@@ -774,7 +796,138 @@ class HiCacheController:
                 node_ids=op.node_ids,
             )
         )
+        self._register_load_ack(producer_event.finish_event, op)
         return producer_id
+
+    def _normalize_node_key(self, node_id) -> str:
+        if hasattr(node_id, "rid"):
+            return str(node_id.rid)
+        return str(node_id)
+
+    def _register_write_ack(self, finish_event: device_module.Event, op: CacheOperation):
+        event_id = id(finish_event)
+        with self._workload_lock:
+            self._write_ack_tokens_by_event[event_id] = int(op.device_indices.shape[0])
+            self._write_nodes_by_event[event_id] = {
+                self._normalize_node_key(node_id)
+                for node_id in op.node_ids
+                if node_id != -1
+            }
+
+    def _register_load_ack(self, finish_event: device_module.Event, op: CacheOperation):
+        event_id = id(finish_event)
+        with self._workload_lock:
+            self._load_ack_tokens_by_event[event_id] = int(op.host_indices.shape[0])
+
+    def _prune_stale_event_maps(self) -> None:
+        live_write_event_ids = {id(ack.finish_event) for ack in self.ack_write_queue}
+        live_load_event_ids = {id(ack.finish_event) for ack in self.ack_load_queue}
+        self._write_ack_tokens_by_event = {
+            event_id: tokens
+            for event_id, tokens in self._write_ack_tokens_by_event.items()
+            if event_id in live_write_event_ids
+        }
+        self._write_nodes_by_event = {
+            event_id: keys
+            for event_id, keys in self._write_nodes_by_event.items()
+            if event_id in live_write_event_ids
+        }
+        self._seen_finished_write_events = {
+            event_id
+            for event_id in self._seen_finished_write_events
+            if event_id in live_write_event_ids
+        }
+        self._load_ack_tokens_by_event = {
+            event_id: tokens
+            for event_id, tokens in self._load_ack_tokens_by_event.items()
+            if event_id in live_load_event_ids
+        }
+        self._seen_finished_load_events = {
+            event_id
+            for event_id in self._seen_finished_load_events
+            if event_id in live_load_event_ids
+        }
+
+    def _refresh_workload_rates(self) -> None:
+        now = time.monotonic()
+        dt = max(now - self._last_workload_update_ts, 1e-6)
+
+        finished_write_tokens = 0
+        finished_load_tokens = 0
+
+        for ack in self.ack_write_queue:
+            event_id = id(ack.finish_event)
+            if event_id in self._seen_finished_write_events:
+                continue
+            if ack.finish_event.query():
+                finished_write_tokens += self._write_ack_tokens_by_event.get(event_id, 0)
+                self._seen_finished_write_events.add(event_id)
+
+        for ack in self.ack_load_queue:
+            event_id = id(ack.finish_event)
+            if event_id in self._seen_finished_load_events:
+                continue
+            if ack.finish_event.query():
+                finished_load_tokens += self._load_ack_tokens_by_event.get(event_id, 0)
+                self._seen_finished_load_events.add(event_id)
+
+        if finished_write_tokens > 0:
+            speed = float(finished_write_tokens) / dt
+            self._running_write_speed_tokens_per_s = (
+                0.9 * self._running_write_speed_tokens_per_s + 0.1 * speed
+            )
+        if finished_load_tokens > 0:
+            speed = float(finished_load_tokens) / dt
+            self._running_load_speed_tokens_per_s = (
+                0.9 * self._running_load_speed_tokens_per_s + 0.1 * speed
+            )
+
+        self._last_workload_update_ts = now
+        self._prune_stale_event_maps()
+
+    def get_writing_workload(self) -> Tuple[int, float]:
+        with self._workload_lock:
+            self._refresh_workload_rates()
+            queue_tokens = sum(int(op.device_indices.shape[0]) for op in self.write_queue)
+            inflight_tokens = 0
+            for ack in self.ack_write_queue:
+                if not ack.finish_event.query():
+                    inflight_tokens += self._write_ack_tokens_by_event.get(
+                        id(ack.finish_event), 0
+                    )
+            return queue_tokens + inflight_tokens, self._running_write_speed_tokens_per_s
+
+    def get_loading_workload(self) -> Tuple[int, float]:
+        with self._workload_lock:
+            self._refresh_workload_rates()
+            queue_tokens = sum(int(op.host_indices.shape[0]) for op in self.load_queue)
+            inflight_tokens = 0
+            for ack in self.ack_load_queue:
+                if not ack.finish_event.query():
+                    inflight_tokens += self._load_ack_tokens_by_event.get(
+                        id(ack.finish_event), 0
+                    )
+            return queue_tokens + inflight_tokens, self._running_load_speed_tokens_per_s
+
+    def is_writing(self, node_id) -> bool:
+        node_key = self._normalize_node_key(node_id)
+        with self._workload_lock:
+            for op in self.write_queue:
+                if node_key in {
+                    self._normalize_node_key(x) for x in op.node_ids if x != -1
+                }:
+                    return True
+            for ack in self.ack_write_queue:
+                event_id = id(ack.finish_event)
+                if ack.finish_event.query():
+                    continue
+                if node_key in self._write_nodes_by_event.get(event_id, set()):
+                    return True
+            return False
+
+    def get_write_through_backlog(self) -> int:
+        pending, _ = self.get_writing_workload()
+        return pending
 
     def evict_device(self, device_indices: torch.Tensor) -> int:
         self.mem_pool_device_allocator.free(device_indices)

@@ -16,6 +16,7 @@ import copy
 import importlib.util
 import json
 import os
+import pickle
 import random
 import shutil
 import sys
@@ -25,7 +26,7 @@ import uuid
 import warnings
 from argparse import ArgumentParser
 from copy import deepcopy
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, Union
@@ -54,6 +55,44 @@ TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) a
 )
 
 global args
+
+
+def _default_request_outputs_file(args: argparse.Namespace) -> str:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{args.backend}_{args.dataset_name}_request_outputs_{ts}.pkl"
+
+
+def _serialize_request_outputs(path: Path, outputs: List["RequestFuncOutput"]) -> None:
+    suffix = path.suffix.lower()
+    if suffix in ("", ".pkl", ".pickle"):
+        with path.open("wb") as f:
+            pickle.dump(outputs, f)
+        return
+
+    if suffix == ".jsonl":
+        with path.open("w", encoding="utf-8") as f:
+            for output in outputs:
+                f.write(json.dumps(asdict(output), ensure_ascii=False) + "\n")
+        return
+
+    raise ValueError(
+        f"Unsupported request outputs file extension: {suffix}. "
+        "Use .pkl/.pickle or .jsonl"
+    )
+
+
+def save_request_outputs(outputs: List["RequestFuncOutput"], output_path: str) -> None:
+    path = Path(output_path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        _serialize_request_outputs(temp_path, outputs)
+        os.replace(temp_path, path)
+        print(f"Saved request outputs to {path}")
+    finally:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
 
 
 # don't want to import sglang package here
@@ -617,6 +656,12 @@ async def async_request_sglang_generate(
             "logprob_start_len": args.logprob_start_len,
             **request_func_input.extra_request_body,
         }
+        if args.output_speed is not None:
+            sampling_params = payload.get("sampling_params")
+            if not isinstance(sampling_params, dict):
+                sampling_params = {}
+                payload["sampling_params"] = sampling_params
+            sampling_params["output_speed"] = args.output_speed
         if args.top_logprobs_num > 0:
             payload["top_logprobs_num"] = args.top_logprobs_num
         if args.token_ids_logprob is not None:
@@ -1380,6 +1425,18 @@ async def benchmark(
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
 
+    if args.save_request_outputs:
+        request_outputs_file = (
+            args.request_outputs_file or _default_request_outputs_file(args)
+        )
+        try:
+            save_request_outputs(outputs, request_outputs_file)
+        except Exception as e:
+            warnings.warn(
+                f"Failed to save request outputs to {request_outputs_file}: {e}",
+                stacklevel=2,
+            )
+
     # Stop profiler (only if profile_steps was not provided, as it auto-stops)
     if profile and not (
         hasattr(args, "profile_steps") and args.profile_steps is not None
@@ -1556,6 +1613,7 @@ async def benchmark(
             "random_input_len": args.random_input_len,
             "random_output_len": args.random_output_len,
             "random_range_ratio": args.random_range_ratio,
+            "output_speed": args.output_speed,
             # Information
             "server_info": server_info,
             # Results
@@ -1693,6 +1751,15 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "served_model_name"):
         args.served_model_name = None
+
+    if not hasattr(args, "save_request_outputs"):
+        args.save_request_outputs = False
+    if not hasattr(args, "request_outputs_file"):
+        args.request_outputs_file = None
+    if not hasattr(args, "output_speed"):
+        args.output_speed = None
+    if args.output_speed is not None and args.output_speed <= 0:
+        raise ValueError("--output-speed must be greater than 0 when provided")
 
     if getattr(args, "print_requests", False):
         assert args.backend == "sglang-oai-chat"  # only support this now
@@ -2036,6 +2103,12 @@ if __name__ == "__main__":
         "Otherwise, we use Poisson process to synthesize the request arrival times. Default is inf.",
     )
     parser.add_argument(
+        "--output-speed",
+        type=float,
+        default=None,
+        help="Set sampling_params.output_speed for each request (sglang backends only).",
+    )
+    parser.add_argument(
         "--use-trace-timestamps",
         action="store_true",
         help="Use timestamps from the trace file for request scheduling. Only valid for 'mooncake' dataset.",
@@ -2054,6 +2127,18 @@ if __name__ == "__main__":
         "if the server is not processing requests fast enough to keep up.",
     )
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
+    parser.add_argument(
+        "--save-request-outputs",
+        action="store_true",
+        help="Persist all per-request RequestFuncOutput records to disk.",
+    )
+    parser.add_argument(
+        "--request-outputs-file",
+        type=str,
+        default=None,
+        help="Path for saved request outputs (.pkl/.pickle or .jsonl). "
+        "If not set, a timestamped .pkl name is used.",
+    )
     parser.add_argument(
         "--output-details", action="store_true", help="Output details of benchmarking."
     )

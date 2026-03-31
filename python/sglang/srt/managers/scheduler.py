@@ -23,7 +23,7 @@ from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Any, Deque, Dict, List, Optional, Tuple, Union
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.utils.common import suppress_noisy_warnings
 
@@ -156,8 +156,10 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
+    OffloadPolicyRuntimeSnapshot,
     PrefillAdder,
     SchedulePolicy,
+    create_offload_reschedule_policy,
 )
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
@@ -237,6 +239,8 @@ logger = logging.getLogger(__name__)
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
+_KV_OFFLOAD_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_KV_OFFLOAD_POLICY_DEBUG_LOG")
+_ENABLE_SYNC_CACHE = get_bool_env_var("SGLANG_ENABLE_SYNC_CACHE")
 
 _is_npu = is_npu()
 
@@ -714,9 +718,14 @@ class Scheduler(
             and server_args.disable_radix_cache
         ):
             if not self.is_hybrid_swa:
-                from sglang.srt.mem_cache.chunk_cache import ChunkCache
+                if _ENABLE_SYNC_CACHE:
+                    from sglang.srt.mem_cache.sync_cache import SyncCache
 
-                self.tree_cache = ChunkCache(params)
+                    self.tree_cache = SyncCache(params=params, server_args=server_args)
+                else:
+                    from sglang.srt.mem_cache.chunk_cache import ChunkCache
+
+                    self.tree_cache = ChunkCache(params)
             else:
                 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
@@ -804,6 +813,7 @@ class Scheduler(
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
+        self.schedule_tick = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
@@ -884,6 +894,94 @@ class Scheduler(
             self.init_new_token_ratio - self.min_new_token_ratio
         ) / envs.SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS.get()
         self.new_token_ratio = self.init_new_token_ratio
+
+        self.kv_offload_reschedule_interval = (
+            self.server_args.kv_offload_reschedule_interval
+        )
+        self.last_kv_offload_reschedule_time: Optional[float] = None
+        self.offload_request_buffer_tokens: Dict[str, float] = {}
+        self.offload_request_output_speeds: Dict[str, float] = {}
+        self.offload_request_rebuffer_times: Dict[str, float] = {}
+        self.last_kv_offload_buffer_decay_time: Optional[float] = None
+        self.offload_reschedule_policy = None
+        if self.server_args.kv_offload_policy != "default":
+            self.offload_reschedule_policy = create_offload_reschedule_policy(
+                self.server_args
+            )
+
+    def _resolve_kv_offload_output_speed(self, req: Req) -> float:
+        speed = self.server_args.kv_offload_default_output_speed
+        sampling_params = getattr(req, "sampling_params", None)
+        if sampling_params is not None:
+            if hasattr(sampling_params, "output_speed"):
+                try:
+                    speed = float(getattr(sampling_params, "output_speed"))
+                except (TypeError, ValueError):
+                    pass
+            custom_params = getattr(sampling_params, "custom_params", None)
+            if isinstance(custom_params, dict) and "output_speed" in custom_params:
+                try:
+                    speed = float(custom_params["output_speed"])
+                except (TypeError, ValueError):
+                    pass
+        if speed <= 0:
+            speed = self.server_args.kv_offload_default_output_speed
+        return max(float(speed), 1e-6)
+
+    def _ensure_kv_offload_request_state(self, req: Req) -> None:
+        if self.offload_reschedule_policy is None:
+            return
+        rid = req.rid
+        if rid not in self.offload_request_buffer_tokens:
+            self.offload_request_buffer_tokens[rid] = 0.0
+        if rid not in self.offload_request_rebuffer_times:
+            self.offload_request_rebuffer_times[rid] = 0.0
+        self.offload_request_output_speeds[rid] = self._resolve_kv_offload_output_speed(req)
+
+    def _on_kv_offload_tokens_produced(self, req: Req, token_count: int) -> None:
+        if self.offload_reschedule_policy is None or token_count <= 0:
+            return
+        self._ensure_kv_offload_request_state(req)
+        self.offload_request_buffer_tokens[req.rid] += float(token_count)
+
+    def _decay_kv_offload_request_buffers(self, now: Optional[float] = None) -> None:
+        if self.offload_reschedule_policy is None:
+            return
+        if now is None:
+            now = time.time()
+        if self.last_kv_offload_buffer_decay_time is None:
+            self.last_kv_offload_buffer_decay_time = now
+            return
+        elapsed = now - self.last_kv_offload_buffer_decay_time
+        if elapsed <= 0:
+            return
+
+        for rid, cur_buffer in list(self.offload_request_buffer_tokens.items()):
+            output_speed = self.offload_request_output_speeds.get(rid, 0.0)
+            if output_speed <= 0:
+                continue
+            next_buffer = cur_buffer - elapsed * output_speed
+            if next_buffer < 0:
+                self.offload_request_rebuffer_times[rid] = (
+                    self.offload_request_rebuffer_times.get(rid, 0.0)
+                    + (-next_buffer) / max(output_speed, 1e-6)
+                )
+            self.offload_request_buffer_tokens[rid] = next_buffer
+
+        self.last_kv_offload_buffer_decay_time = now
+
+    def _gc_kv_offload_request_state(self) -> None:
+        if self.offload_reschedule_policy is None:
+            return
+        live_rids = {req.rid for req in self.waiting_queue}
+        if not self.running_batch.is_empty():
+            live_rids.update(req.rid for req in self.running_batch.reqs)
+
+        for rid in list(self.offload_request_buffer_tokens.keys()):
+            if rid not in live_rids:
+                self.offload_request_buffer_tokens.pop(rid, None)
+                self.offload_request_output_speeds.pop(rid, None)
+                self.offload_request_rebuffer_times.pop(rid, None)
 
     def init_soft_watchdog(self, server_args: ServerArgs):
         if (x := server_args.soft_watchdog_timeout) is not None:
@@ -1838,6 +1936,7 @@ class Scheduler(
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        self._ensure_kv_offload_request_state(req)
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if not self._set_or_validate_priority(req):
                 return
@@ -2078,6 +2177,8 @@ class Scheduler(
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        self.schedule_tick += 1
+        self._decay_kv_offload_request_buffers()
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout()
         if self.dllm_config is not None:
@@ -2108,6 +2209,8 @@ class Scheduler(
                 self.running_batch.hisparse_coordinator = self.hisparse_coordinator
         else:
             if self.last_batch and self.last_batch.forward_mode.is_extend():
+                if hasattr(self.tree_cache, "sync_batch"):
+                    self.tree_cache.sync_batch(self.last_batch)
                 if self.last_batch.chunked_req is not None:
                     # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                     # We need to discard it.
@@ -2219,6 +2322,167 @@ class Scheduler(
 
         return ret
 
+    def _maybe_apply_offload_reschedule_policy(self, trigger_point: str) -> None:
+        if self.offload_reschedule_policy is None:
+            return
+        now = time.time()
+        self._decay_kv_offload_request_buffers(now=now)
+        self._gc_kv_offload_request_state()
+        if (
+            self.last_kv_offload_reschedule_time is not None
+            and now - self.last_kv_offload_reschedule_time
+            < self.kv_offload_reschedule_interval
+        ):
+            return
+        self.last_kv_offload_reschedule_time = now
+
+        num_used, _, available_size, evictable_size = self._get_token_info()
+        protected_size = self.max_total_num_tokens - (
+            num_used + available_size + evictable_size
+        )
+        workload_snapshot = self._collect_offload_workload_snapshot()
+        snapshot = OffloadPolicyRuntimeSnapshot(
+            schedule_tick=self.schedule_tick,
+            running_reqs=list(self.running_batch.reqs),
+            waiting_reqs=list(self.waiting_queue),
+            available_tokens=available_size,
+            evictable_tokens=evictable_size,
+            protected_tokens=protected_size,
+            workload_snapshot=workload_snapshot,
+            request_buffer_tokens=dict(self.offload_request_buffer_tokens),
+            request_output_speeds=dict(self.offload_request_output_speeds),
+            request_rebuffer_times=dict(self.offload_request_rebuffer_times),
+            reschedule_interval_s=float(self.kv_offload_reschedule_interval),
+            buffer_conservativeness=float(
+                self.server_args.kv_offload_buffer_conservativeness
+            ),
+        )
+        decision = self.offload_reschedule_policy.compute(snapshot)
+
+        if not self.check_kv_offload_policy_decision(
+            decision, self.running_batch.reqs, self.waiting_queue
+        ):
+            return
+
+        moved_from_running = self._apply_offload_reschedule_decision(decision)
+
+        if _KV_OFFLOAD_POLICY_DEBUG_LOG:
+            logger.info(
+                "[KV Offload Policy] tick=%d point=%s running=%d keep_running=%d load=%d prefill=%d moved_from_running=%d terms=%s",
+                self.schedule_tick,
+                trigger_point,
+                len(self.running_batch.reqs),
+                len(decision.keep_running_list),
+                len(decision.new_load_list),
+                len(decision.new_prefill_list),
+                moved_from_running,
+                decision.objective_terms,
+            )
+
+    def _collect_offload_workload_snapshot(self) -> Optional[Dict[str, float]]:
+        tree_cache = self.tree_cache
+        if isinstance(tree_cache, SessionAwareCache):
+            tree_cache = tree_cache.inner
+
+        loading_workload = None
+        writing_workload = None
+        backlog_tokens = None
+        pending_write_acks = 0
+        pending_load_acks = 0
+
+        cache_controller = getattr(tree_cache, "cache_controller", None)
+        if cache_controller is not None:
+            if hasattr(cache_controller, "get_loading_workload"):
+                loading_workload = cache_controller.get_loading_workload()
+            if hasattr(cache_controller, "get_writing_workload"):
+                writing_workload = cache_controller.get_writing_workload()
+            if hasattr(cache_controller, "get_write_through_backlog"):
+                backlog_tokens = cache_controller.get_write_through_backlog()
+            pending_write_acks = len(getattr(cache_controller, "ack_write_queue", []))
+            pending_load_acks = len(getattr(cache_controller, "ack_load_queue", []))
+        else:
+            if hasattr(tree_cache, "get_loading_workload"):
+                loading_workload = tree_cache.get_loading_workload()
+            if hasattr(tree_cache, "get_writing_workload"):
+                writing_workload = tree_cache.get_writing_workload()
+            if hasattr(tree_cache, "get_write_through_backlog"):
+                backlog_tokens = tree_cache.get_write_through_backlog()
+
+        if loading_workload is None and writing_workload is None:
+            return None
+
+        loading_tokens, loading_speed = loading_workload or (0, 0.0)
+        writing_tokens, writing_speed = writing_workload or (0, 0.0)
+        if backlog_tokens is None:
+            backlog_tokens = writing_tokens
+
+        return {
+            "workload_metrics_available": 1.0,
+            "loading_backlog_tokens": float(loading_tokens),
+            "writing_backlog_tokens": float(writing_tokens),
+            "write_through_backlog_tokens": float(backlog_tokens),
+            "load_speed_tokens_per_s": float(loading_speed),
+            "write_speed_tokens_per_s": float(writing_speed),
+            "pending_write_acks": float(pending_write_acks),
+            "pending_load_acks": float(pending_load_acks),
+        }
+
+    def _apply_offload_reschedule_decision(self, decision) -> int:
+        """Apply keep/load/prefill decisions with queue migration and safe KV release."""
+        moved_from_running = 0
+
+        running_reqs = self.running_batch.reqs
+        keep_running_set = set(decision.keep_running_list)
+        keep_indices = [i for i, req in enumerate(running_reqs) if req in keep_running_set]
+        remove_indices = [i for i, req in enumerate(running_reqs) if req not in keep_running_set]
+
+        removed_running_reqs: List[Req] = [running_reqs[i] for i in remove_indices]
+        if remove_indices:
+            moved_from_running = len(remove_indices)
+            # Release KV for removed running requests before filtering them out.
+            for remove_ct, idx in enumerate(sorted(remove_indices, reverse=True)):
+                remaining_req_count = len(running_reqs) - remove_ct - 1
+                self.running_batch.release_req(idx, remaining_req_count, self.server_args)
+
+            if keep_indices:
+                self.running_batch.filter_batch(keep_indices=keep_indices)
+            else:
+                self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+
+        # Build explicit decision groups for waiting requests.
+        waiting_set = set(self.waiting_queue)
+        ordered_load: List[Req] = []
+        ordered_prefill: List[Req] = []
+        seen_waiting: Set[Req] = set()
+
+        for req in decision.new_load_list:
+            if req in waiting_set and req not in seen_waiting:
+                ordered_load.append(req)
+                seen_waiting.add(req)
+
+        for req in decision.new_prefill_list:
+            if req in waiting_set and req not in seen_waiting:
+                # Force recompute path semantics for selected prefill candidates.
+                if len(req.output_ids) > 0:
+                    req.reset_for_retract()
+                ordered_prefill.append(req)
+                seen_waiting.add(req)
+
+        # Requests removed from running but not explicitly selected default to load path.
+        selected_rids = {req.rid for req in decision.new_load_list + decision.new_prefill_list}
+        for req in removed_running_reqs:
+            if req.rid in selected_rids:
+                continue
+            ordered_load.append(req)
+
+        ordered_waiting: List[Req] = ordered_load + ordered_prefill
+        for req in self.waiting_queue:
+            if req not in seen_waiting:
+                ordered_waiting.append(req)
+
+        self.waiting_queue = ordered_waiting
+        return moved_from_running
+
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
@@ -2254,6 +2518,10 @@ class Scheduler(
         ):
             self.running_batch.batch_is_full = True
             return None
+
+        self._maybe_apply_offload_reschedule_policy(
+            trigger_point="before_prefill_candidate"
+        )
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, self.running_batch)
@@ -2504,6 +2772,10 @@ class Scheduler(
                 self.new_token_ratio - self.new_token_ratio_decay,
                 self.min_new_token_ratio,
             )
+
+        self._maybe_apply_offload_reschedule_policy(
+            trigger_point="after_decode_memory_check"
+        )
 
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False

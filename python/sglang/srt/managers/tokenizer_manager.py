@@ -944,7 +944,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         if self.preferred_sampling_params:
             sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
         else:
-            sampling_kwargs = obj.sampling_params
+            sampling_kwargs = dict(obj.sampling_params)
+
+        # Backward-compatible extension: accept request-level output_speed used by
+        # kv-offload request-buffer scheduling without changing SamplingParams API.
+        if "output_speed" in sampling_kwargs:
+            custom_params = dict(sampling_kwargs.get("custom_params") or {})
+            custom_params["output_speed"] = sampling_kwargs.pop("output_speed")
+            sampling_kwargs["custom_params"] = custom_params
+
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)

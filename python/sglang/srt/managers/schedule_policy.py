@@ -26,10 +26,12 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
+import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import torch
 
@@ -91,6 +93,443 @@ class CacheAgnosticPolicy(Enum):
     LOF = "lof"  # longest output first
     RANDOM = "random"
     ROUTING_KEY = "routing-key"  # prioritize by routing key frequency in running batch
+
+
+@dataclass
+class OffloadPolicyRuntimeSnapshot:
+    schedule_tick: int
+    running_reqs: List[Req]
+    waiting_reqs: List[Req]
+    available_tokens: int
+    evictable_tokens: int
+    protected_tokens: int
+    workload_snapshot: Optional[Dict[str, float]] = None
+    request_buffer_tokens: Optional[Dict[str, float]] = None
+    request_output_speeds: Optional[Dict[str, float]] = None
+    request_rebuffer_times: Optional[Dict[str, float]] = None
+    reschedule_interval_s: float = 0.0
+    buffer_conservativeness: float = 1.0
+
+
+@dataclass
+class OffloadRescheduleDecision:
+    keep_running_list: List[Req]
+    new_load_list: List[Req]
+    new_prefill_list: List[Req]
+    objective_terms: Dict[str, float]
+
+
+class OffloadReschedulePolicy:
+    """Interface for KV offload-aware queue re-scheduling policies."""
+
+    def compute(
+        self, snapshot: OffloadPolicyRuntimeSnapshot
+    ) -> OffloadRescheduleDecision:
+        raise NotImplementedError
+
+
+class DefaultOffloadReschedulePolicy(OffloadReschedulePolicy):
+    def compute(
+        self, snapshot: OffloadPolicyRuntimeSnapshot
+    ) -> OffloadRescheduleDecision:
+        load_list, prefill_list = _split_waiting_reqs(snapshot.waiting_reqs)
+        return OffloadRescheduleDecision(
+            keep_running_list=list(snapshot.running_reqs),
+            new_load_list=load_list,
+            new_prefill_list=prefill_list,
+            objective_terms={
+                "token_value": 0.0,
+                "load_cost": 0.0,
+                "evict_cost": 0.0,
+                "recompute_cost": 0.0,
+                "buffer_penalty": 0.0,
+                "objective": 0.0,
+            },
+        )
+
+
+class PaperV1OffloadReschedulePolicy(OffloadReschedulePolicy):
+    _LOCAL_SEARCH_MAX_STEPS = 5
+    _POSITION_DISCOUNT = 0.985
+    _EPS = 1e-6
+
+    def __init__(self, server_args: ServerArgs):
+        self.alpha = server_args.kv_offload_token_value_alpha
+        self.beta = server_args.kv_offload_load_cost_beta
+        self.gamma = server_args.kv_offload_evict_cost_gamma
+        self.delta = server_args.kv_offload_recompute_cost_delta
+        self.buffer_conservativeness = (
+            server_args.kv_offload_buffer_conservativeness
+        )
+        self.enable_local_search = server_args.kv_offload_enable_local_search
+
+    def compute(
+        self, snapshot: OffloadPolicyRuntimeSnapshot
+    ) -> OffloadRescheduleDecision:
+        keep_running_list = self._select_keep_running_list(snapshot)
+        candidate_map = self._build_candidate_map(
+            snapshot.waiting_reqs,
+            snapshot.workload_snapshot,
+            snapshot,
+        )
+        greedy_order = self._greedy_select(candidate_map)
+        objective_before_local_search = self._evaluate_order(greedy_order, candidate_map)
+        refined_order = list(greedy_order)
+        if self.enable_local_search:
+            refined_order = self._local_search(refined_order, candidate_map)
+        objective_after_local_search = self._evaluate_order(refined_order, candidate_map)
+
+        load_list, prefill_list = self._materialize_decision_order(refined_order)
+
+        token_value_sum = 0.0
+        load_cost_sum = 0.0
+        evict_cost_sum = 0.0
+        recompute_cost_sum = 0.0
+        buffer_penalty_sum = 0.0
+        for req, mode in refined_order:
+            terms = candidate_map[(req.rid, mode)]["terms"]
+            token_value_sum += terms["token_value"]
+            load_cost_sum += terms["load_cost"]
+            evict_cost_sum += terms["evict_cost"]
+            recompute_cost_sum += terms["recompute_cost"]
+            buffer_penalty_sum += terms["buffer_penalty"]
+
+        objective = objective_after_local_search
+        evicted_running_count = float(max(len(snapshot.running_reqs) - len(keep_running_list), 0))
+        return OffloadRescheduleDecision(
+            keep_running_list=keep_running_list,
+            new_load_list=load_list,
+            new_prefill_list=prefill_list,
+            objective_terms={
+                "token_value": token_value_sum,
+                "load_cost": load_cost_sum,
+                "evict_cost": evict_cost_sum,
+                "recompute_cost": recompute_cost_sum,
+                "buffer_penalty": buffer_penalty_sum,
+                "objective": objective,
+                "objective_before_local_search": objective_before_local_search,
+                "objective_after_local_search": objective_after_local_search,
+                "selected_load_count": float(len(load_list)),
+                "selected_prefill_count": float(len(prefill_list)),
+                "evicted_running_count": evicted_running_count,
+                **self._build_ibt_stats(snapshot, keep_running_list),
+            },
+        )
+
+    def _select_keep_running_list(
+        self, snapshot: OffloadPolicyRuntimeSnapshot
+    ) -> List[Req]:
+        running_reqs = list(snapshot.running_reqs)
+        if len(running_reqs) <= 1 or len(snapshot.waiting_reqs) == 0:
+            return running_reqs
+
+        pause_time = self._estimate_pause_time(snapshot)
+        threshold = pause_time * max(snapshot.buffer_conservativeness, self._EPS)
+        evictable: List[Tuple[float, Req]] = []
+        keep_list: List[Req] = []
+        for req in running_reqs:
+            _, speed, _, ibt = self._get_request_buffer_stats(req, snapshot)
+            if speed <= self._EPS:
+                keep_list.append(req)
+                continue
+            if ibt >= threshold:
+                evictable.append((ibt, req))
+            else:
+                keep_list.append(req)
+
+        # Keep at least one running request to avoid empty decode churn.
+        max_swaps = min(
+            len(evictable),
+            max(len(snapshot.waiting_reqs) // 2, 1),
+            max(len(running_reqs) - 1, 0),
+        )
+        if max_swaps <= 0:
+            return running_reqs
+
+        evictable.sort(key=lambda x: (-x[0], x[1].rid))
+        swapped_out = {req for _, req in evictable[:max_swaps]}
+        for req in running_reqs:
+            if req not in swapped_out and req not in keep_list:
+                keep_list.append(req)
+        return keep_list
+
+    def _estimate_pause_time(self, snapshot: OffloadPolicyRuntimeSnapshot) -> float:
+        interval = max(snapshot.reschedule_interval_s, 0.0)
+        workload = snapshot.workload_snapshot or {}
+
+        load_tokens = float(workload.get("loading_backlog_tokens", 0.0))
+        write_tokens = float(workload.get("writing_backlog_tokens", 0.0))
+        load_speed = max(float(workload.get("load_speed_tokens_per_s", 0.0)), 1.0)
+        write_speed = max(float(workload.get("write_speed_tokens_per_s", 0.0)), 1.0)
+
+        transfer_time = (load_tokens / load_speed) + (write_tokens / write_speed)
+        return max(interval + transfer_time, interval)
+
+    def _get_request_buffer_stats(
+        self, req: Req, snapshot: OffloadPolicyRuntimeSnapshot
+    ) -> Tuple[float, float, float, float]:
+        buffer_tokens = float((snapshot.request_buffer_tokens or {}).get(req.rid, 0.0))
+        output_speed = float((snapshot.request_output_speeds or {}).get(req.rid, 0.0))
+        rebuffer_time = float((snapshot.request_rebuffer_times or {}).get(req.rid, 0.0))
+        if output_speed <= self._EPS:
+            return buffer_tokens, output_speed, rebuffer_time, float("inf")
+        ibt = buffer_tokens / output_speed
+        return buffer_tokens, output_speed, rebuffer_time, ibt
+
+    def _build_ibt_stats(
+        self, snapshot: OffloadPolicyRuntimeSnapshot, keep_running_list: List[Req]
+    ) -> Dict[str, float]:
+        running_ibts = [
+            self._get_request_buffer_stats(req, snapshot)[3]
+            for req in snapshot.running_reqs
+            if self._get_request_buffer_stats(req, snapshot)[1] > self._EPS
+        ]
+        keep_ibts = [
+            self._get_request_buffer_stats(req, snapshot)[3]
+            for req in keep_running_list
+            if self._get_request_buffer_stats(req, snapshot)[1] > self._EPS
+        ]
+
+        def _safe_median(values: List[float]) -> float:
+            if not values:
+                return 0.0
+            values = sorted(values)
+            n = len(values)
+            if n % 2 == 1:
+                return float(values[n // 2])
+            return float((values[n // 2 - 1] + values[n // 2]) * 0.5)
+
+        return {
+            "running_ibt_min": float(min(running_ibts)) if running_ibts else 0.0,
+            "running_ibt_median": _safe_median(running_ibts),
+            "keep_running_ibt_min": float(min(keep_ibts)) if keep_ibts else 0.0,
+            "keep_running_ibt_median": _safe_median(keep_ibts),
+        }
+
+    def _build_candidate_map(
+        self,
+        waiting_reqs: Sequence[Req],
+        workload_snapshot: Optional[Dict[str, float]] = None,
+        snapshot: Optional[OffloadPolicyRuntimeSnapshot] = None,
+    ):
+        candidate_map: Dict[Tuple[str, str], Dict[str, Union[Req, float, Dict[str, float]]]] = {}
+        for req in waiting_reqs:
+            terms_prefill = self._estimate_terms(
+                req,
+                mode="prefill",
+                workload_snapshot=workload_snapshot,
+                snapshot=snapshot,
+            )
+            objective_prefill = (
+                terms_prefill["token_value"]
+                - terms_prefill["load_cost"]
+                - terms_prefill["evict_cost"]
+                - terms_prefill["recompute_cost"]
+                - terms_prefill["buffer_penalty"]
+            )
+            candidate_map[(req.rid, "prefill")] = {
+                "req": req,
+                "objective": objective_prefill,
+                "terms": terms_prefill,
+            }
+
+            if req.retracted_stain or len(req.output_ids) > 0:
+                terms_load = self._estimate_terms(
+                    req,
+                    mode="load",
+                    workload_snapshot=workload_snapshot,
+                    snapshot=snapshot,
+                )
+                objective_load = (
+                    terms_load["token_value"]
+                    - terms_load["load_cost"]
+                    - terms_load["evict_cost"]
+                    - terms_load["recompute_cost"]
+                    - terms_load["buffer_penalty"]
+                )
+                candidate_map[(req.rid, "load")] = {
+                    "req": req,
+                    "objective": objective_load,
+                    "terms": terms_load,
+                }
+
+        return candidate_map
+
+    def _estimate_terms(
+        self,
+        req: Req,
+        mode: str,
+        workload_snapshot: Optional[Dict[str, float]] = None,
+        snapshot: Optional[OffloadPolicyRuntimeSnapshot] = None,
+    ) -> Dict[str, float]:
+        total_len = len(req.origin_input_ids) + len(req.output_ids)
+        prefix_len = len(getattr(req, "prefix_indices", ()))
+        recompute_span = float(max(total_len - prefix_len, 0))
+        buffer_tokens = 0.0
+        output_speed = 0.0
+        rebuffer_time = 0.0
+        ibt = 0.0
+        if snapshot is not None:
+            buffer_tokens, output_speed, rebuffer_time, ibt = self._get_request_buffer_stats(
+                req, snapshot
+            )
+
+        # Buffer-aware proxy: prioritize decode progress and long-waiting requests.
+        wait_utility = 0.0
+        wait_entry = getattr(getattr(req, "time_stats", None), "wait_queue_entry_time", None)
+        if wait_entry is not None:
+            wait_utility = max(time.time() - float(wait_entry), 0.0)
+
+        decode_progress_utility = float(len(req.output_ids) + 1)
+        ttft_proxy = 1.0 / max(len(req.origin_input_ids), 1)
+        ibt_urgency = 1.0 / (1.0 + max(ibt, 0.0))
+        starvation_utility = max(-buffer_tokens, 0.0) + rebuffer_time
+        token_value = self.alpha * (
+            1.5 * ibt_urgency
+            + 0.6 * decode_progress_utility
+            + 0.2 * ttft_proxy
+            + 0.02 * wait_utility
+            + 0.1 * starvation_utility
+        )
+
+        # Stage 05 workload-driven costs (fall back to Stage 03 proxy if unavailable).
+        if workload_snapshot is not None and workload_snapshot.get(
+            "workload_metrics_available", 0.0
+        ) > 0:
+            load_backlog = float(workload_snapshot.get("loading_backlog_tokens", 0.0))
+            write_backlog = float(
+                workload_snapshot.get("writing_backlog_tokens", 0.0)
+            )
+            load_speed = max(
+                float(workload_snapshot.get("load_speed_tokens_per_s", 0.0)), 1.0
+            )
+            write_speed = max(
+                float(workload_snapshot.get("write_speed_tokens_per_s", 0.0)), 1.0
+            )
+
+            load_pressure = 1.0 + (load_backlog / load_speed)
+            write_pressure = 1.0 + (write_backlog / write_speed)
+
+            load_cost = (
+                self.beta * (float(total_len) / load_speed) * load_pressure
+                if mode == "load"
+                else 0.0
+            )
+            evict_cost = (
+                self.gamma
+                * float(getattr(req, "cache_protected_len", 0))
+                * write_pressure
+            )
+        else:
+            load_cost = self.beta * (float(total_len) if mode == "load" else 0.0)
+            evict_cost = self.gamma * float(getattr(req, "cache_protected_len", 0))
+        recompute_cost = self.delta * (recompute_span if mode == "prefill" else 0.0)
+
+        extra_delay = 0.0
+        if snapshot is not None:
+            extra_delay = max(snapshot.reschedule_interval_s, 0.0)
+        predicted_buffer = buffer_tokens - extra_delay * max(output_speed, 0.0)
+        buffer_penalty = max(-predicted_buffer, 0.0)
+
+        return {
+            "token_value": token_value,
+            "load_cost": load_cost,
+            "evict_cost": evict_cost,
+            "recompute_cost": recompute_cost,
+            "buffer_penalty": buffer_penalty,
+        }
+
+    def _greedy_select(self, candidate_map) -> List[Tuple[Req, str]]:
+        per_req_best: Dict[str, Tuple[Req, str, float, float, float]] = {}
+        for (rid, mode), meta in candidate_map.items():
+            req = meta["req"]
+            objective = float(meta["objective"])
+            terms = meta["terms"]
+            tie_value = float(terms["token_value"])
+            tie_cost = float(terms["load_cost"] + terms["recompute_cost"])
+            current = per_req_best.get(rid)
+            candidate_tuple = (req, mode, objective, tie_value, tie_cost)
+            if current is None or self._is_better_candidate(candidate_tuple, current):
+                per_req_best[rid] = candidate_tuple
+
+        selected = list(per_req_best.values())
+        selected.sort(
+            key=lambda x: (
+                -x[2],
+                -x[3],
+                x[4],
+                x[0].rid,
+            )
+        )
+        return [(req, mode) for req, mode, *_ in selected]
+
+    @staticmethod
+    def _is_better_candidate(new_candidate, current_candidate) -> bool:
+        # Compare by objective, then value, then lower costs, then deterministic mode order.
+        if new_candidate[2] != current_candidate[2]:
+            return new_candidate[2] > current_candidate[2]
+        if new_candidate[3] != current_candidate[3]:
+            return new_candidate[3] > current_candidate[3]
+        if new_candidate[4] != current_candidate[4]:
+            return new_candidate[4] < current_candidate[4]
+        return new_candidate[1] < current_candidate[1]
+
+    def _local_search(self, order, candidate_map):
+        if len(order) <= 1:
+            return list(order)
+
+        refined = list(order)
+        cur_obj = self._evaluate_order(refined, candidate_map)
+        for _ in range(self._LOCAL_SEARCH_MAX_STEPS):
+            improved = False
+            for i in range(len(refined) - 1):
+                trial = list(refined)
+                trial[i], trial[i + 1] = trial[i + 1], trial[i]
+                trial_obj = self._evaluate_order(trial, candidate_map)
+                if trial_obj > cur_obj:
+                    refined = trial
+                    cur_obj = trial_obj
+                    improved = True
+                    break
+            if not improved:
+                break
+        return refined
+
+    def _evaluate_order(self, order, candidate_map) -> float:
+        total = 0.0
+        for i, (req, mode) in enumerate(order):
+            total += float(candidate_map[(req.rid, mode)]["objective"]) * (
+                self._POSITION_DISCOUNT**i
+            )
+        return total
+
+    @staticmethod
+    def _materialize_decision_order(order) -> Tuple[List[Req], List[Req]]:
+        load_list: List[Req] = []
+        prefill_list: List[Req] = []
+        for req, mode in order:
+            if mode == "load":
+                load_list.append(req)
+            else:
+                prefill_list.append(req)
+        return load_list, prefill_list
+
+
+def create_offload_reschedule_policy(server_args: ServerArgs) -> OffloadReschedulePolicy:
+    if server_args.kv_offload_policy == "paper_v1":
+        return PaperV1OffloadReschedulePolicy(server_args)
+    return DefaultOffloadReschedulePolicy()
+
+
+def _split_waiting_reqs(waiting_reqs: Sequence[Req]) -> Tuple[List[Req], List[Req]]:
+    load_list: List[Req] = []
+    prefill_list: List[Req] = []
+    for req in waiting_reqs:
+        if req.retracted_stain or len(req.output_ids) > 0:
+            load_list.append(req)
+        else:
+            prefill_list.append(req)
+    return load_list, prefill_list
 
 
 class SchedulePolicy:

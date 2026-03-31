@@ -168,6 +168,8 @@ class SchedulerOutputProcessorMixin:
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
+                    if hasattr(self, "_on_kv_offload_tokens_produced"):
+                        self._on_kv_offload_tokens_produced(req, 1)
                     req.check_finished()
 
                     if req.finished():
@@ -417,10 +419,14 @@ class SchedulerOutputProcessorMixin:
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
+                if hasattr(self, "_on_kv_offload_tokens_produced"):
+                    self._on_kv_offload_tokens_produced(req, 1)
             elif batch.is_spec_v2:
                 # Only spec v2's output_ids are updated here.
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
+                if hasattr(self, "_on_kv_offload_tokens_produced"):
+                    self._on_kv_offload_tokens_produced(req, new_accepted_len)
 
             # Update Mamba last track seqlen
             self._mamba_prefix_cache_update(req, batch, result, i)
