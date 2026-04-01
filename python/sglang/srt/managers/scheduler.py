@@ -2443,7 +2443,11 @@ class Scheduler(
             # Release KV for removed running requests before filtering them out.
             for remove_ct, idx in enumerate(sorted(remove_indices, reverse=True)):
                 req: Req = running_reqs[idx]
-                self.tree_cache.evict_device(req)
+                if hasattr(self.tree_cache, "evict_device"):
+                    self.tree_cache.evict_device(req)
+                else:
+                    # Fallback path for non-sync caches.
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
                 req.reset_for_retract()
 
             if keep_indices:

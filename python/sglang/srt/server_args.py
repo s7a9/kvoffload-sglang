@@ -569,7 +569,7 @@ class ServerArgs:
     kv_offload_reschedule_interval: int = 2
     kv_offload_token_value_alpha: float = 1.0
     kv_offload_load_cost_beta: float = 1e-3
-    kv_offload_evict_cost_gamma: float = 1.0
+    kv_offload_evict_cost_gamma: float = 1e-1
     kv_offload_recompute_cost_delta: float = 1.0
     kv_offload_enable_local_search: bool = False
     kv_offload_default_output_speed: float = 5.0
