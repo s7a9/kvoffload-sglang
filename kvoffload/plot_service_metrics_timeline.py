@@ -29,6 +29,10 @@ def iter_jsonl(path: Path) -> Iterator[Tuple[int, Dict]]:
 
 def infer_consume_speed(tag: str, rec: Dict, cli_speed: float | None) -> float:
     """Resolve per-request token consume speed (tokens/s)."""
+
+    if cli_speed is not None and cli_speed > 0:
+        return float(cli_speed)
+
     output_speed = rec.get("output_speed")
     if isinstance(output_speed, (int, float)) and output_speed > 0:
         return float(output_speed)
@@ -37,16 +41,13 @@ def infer_consume_speed(tag: str, rec: Dict, cli_speed: float | None) -> float:
     if m:
         return float(m.group(1))
 
-    if cli_speed is not None and cli_speed > 0:
-        return float(cli_speed)
-
     raise ValueError(
         f"Cannot infer consume speed for tag '{tag}'. "
         "Please provide --consume-speed (tokens/s)."
     )
 
 
-def build_token_events(rec: Dict) -> Tuple[List[Tuple[float, int]], np.ndarray, np.ndarray]:
+def build_token_events(rec: Dict) -> Tuple[List[Tuple[float, int]], np.ndarray, np.ndarray, np.ndarray]:
     """
     Reconstruct token arrival events: (arrival_time_s, request_id).
 
@@ -54,6 +55,8 @@ def build_token_events(rec: Dict) -> Tuple[List[Tuple[float, int]], np.ndarray, 
     - token_events: sorted list[(time_s, req_id)]
     - send_times: np.ndarray shape [num_requests]
     - token_targets: np.ndarray shape [num_requests], expected token count per request
+    - first_token_times: np.ndarray shape [num_requests], absolute time of first token
+      (inf if the request has no tokens)
     """
     ttfts = rec.get("ttfts", [])
     itls = rec.get("itls", [])
@@ -63,6 +66,7 @@ def build_token_events(rec: Dict) -> Tuple[List[Tuple[float, int]], np.ndarray, 
     n = min(len(ttfts), len(itls), len(output_lens))
     send_times = np.zeros(n, dtype=float)
     token_targets = np.zeros(n, dtype=int)
+    first_token_times = np.full(n, np.inf, dtype=float)
     events: List[Tuple[float, int]] = []
 
     for req_id in range(n):
@@ -85,6 +89,7 @@ def build_token_events(rec: Dict) -> Tuple[List[Tuple[float, int]], np.ndarray, 
             continue
 
         t = send_t + ttft
+        first_token_times[req_id] = t
         events.append((t, req_id))
 
         for delta in itl_list[: token_count - 1]:
@@ -92,7 +97,7 @@ def build_token_events(rec: Dict) -> Tuple[List[Tuple[float, int]], np.ndarray, 
             events.append((t, req_id))
 
     events.sort(key=lambda x: x[0])
-    return events, send_times, token_targets
+    return events, send_times, token_targets, first_token_times
 
 
 def simulate_timeline(
@@ -101,7 +106,7 @@ def simulate_timeline(
     num_steps: int,
 ) -> Dict[str, List[float]]:
     """Simulate request buffer evolution and collect per-step service metrics."""
-    events, send_times, token_targets = build_token_events(rec)
+    events, send_times, token_targets, first_token_times = build_token_events(rec)
     num_requests = len(token_targets)
 
     if num_requests == 0:
@@ -110,6 +115,7 @@ def simulate_timeline(
             "waiting_requests_num": [],
             "running_requests_num": [],
             "active_requests_num": [],
+            "queued_requests_num": [],
             "valid_throughput_tps": [],
         }
 
@@ -123,6 +129,7 @@ def simulate_timeline(
             "waiting_requests_num": [0.0] * num_steps,
             "running_requests_num": [0.0] * num_steps,
             "active_requests_num": [0.0] * num_steps,
+            "queued_requests_num": [0.0] * num_steps,
             "valid_throughput_tps": [0.0] * num_steps,
         }
 
@@ -149,6 +156,7 @@ def simulate_timeline(
         "waiting_requests_num": [],
         "running_requests_num": [],
         "active_requests_num": [],
+        "queued_requests_num": [],
         "valid_throughput_tps": [],
     }
 
@@ -196,13 +204,32 @@ def simulate_timeline(
         )
         completed[newly_completed] = True
 
+        queued_mask = (
+            (send_times <= right + eps)
+            & (token_targets > 0)
+            & (~completed)
+            & (first_token_times > right + eps)
+        )
+
         timeline["time_s"].append(right)
         timeline["waiting_requests_num"].append(float(np.sum(waiting_mask)))
         timeline["running_requests_num"].append(float(np.sum(running_mask)))
         timeline["active_requests_num"].append(float(np.sum(eligible)))
+        timeline["queued_requests_num"].append(float(np.sum(queued_mask)))
         timeline["valid_throughput_tps"].append(valid_throughput)
 
     return timeline
+
+
+def slice_timeline(
+    timeline: Dict[str, List[float]],
+    time_start: float,
+    time_end: float,
+) -> Dict[str, List[float]]:
+    """Keep only the data points whose time falls within [time_start, time_end]."""
+    times = timeline["time_s"]
+    indices = [i for i, t in enumerate(times) if time_start <= t <= time_end]
+    return {key: [values[i] for i in indices] for key, values in timeline.items()}
 
 
 def load_records_by_tags(jsonl_path: Path, tags: List[str]) -> Dict[str, Dict]:
@@ -238,7 +265,7 @@ def plot_metric(
     title: str,
     output_path: Path,
 ) -> None:
-    plt.figure(figsize=(12, 5))
+    plt.figure(figsize=(7, 4))
     for tag, timeline in timelines_by_tag.items():
         plt.plot(timeline["time_s"], timeline[metric_key], linewidth=1.8, label=tag)
 
@@ -294,6 +321,17 @@ def parse_args() -> argparse.Namespace:
         help="Directory to save output figures and optional JSON metrics.",
     )
     parser.add_argument(
+        "--time-range",
+        nargs=2,
+        type=float,
+        metavar=("START", "END"),
+        default=None,
+        help=(
+            "Only keep data within [START, END] seconds and plot that slice. "
+            "Example: --time-range 0 100"
+        ),
+    )
+    parser.add_argument(
         "--dump-json",
         action="store_true",
         help="Dump timeline dict for each tag to out_dir/timeline_metrics.json.",
@@ -313,10 +351,18 @@ def main() -> None:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.time_range is not None:
+        time_start, time_end = args.time_range
+        if time_start >= time_end:
+            raise ValueError("--time-range START must be less than END")
+        print(f"Time range filter: [{time_start}, {time_end}] s")
+
     timelines_by_tag: Dict[str, Dict[str, List[float]]] = {}
     for tag, rec in records_by_tag.items():
         speed = infer_consume_speed(tag, rec, args.consume_speed)
         timeline = simulate_timeline(rec=rec, consume_speed=speed, num_steps=args.num_steps)
+        if args.time_range is not None:
+            timeline = slice_timeline(timeline, time_start, time_end)
         timelines_by_tag[tag] = timeline
         print(f"Simulated tag={tag}, consume_speed={speed:.4f} tok/s")
 
@@ -326,6 +372,13 @@ def main() -> None:
         ylabel="Waiting Requests Num",
         title="Waiting Requests Num Over Time",
         output_path=args.out_dir / "waiting_requests_num.png",
+    )
+    plot_metric(
+        timelines_by_tag=timelines_by_tag,
+        metric_key="queued_requests_num",
+        ylabel="Queued Requests Num",
+        title="Queued Requests Num Over Time",
+        output_path=args.out_dir / "queued_requests_num.png",
     )
     plot_metric(
         timelines_by_tag=timelines_by_tag,

@@ -254,7 +254,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--jsonl-path",
         type=Path,
-        default=Path("bench_results.jsonl"),
+        default=Path("kvoffload/bench_results.jsonl"),
         help="Input benchmark JSONL path (each line is one experiment).",
     )
     parser.add_argument(

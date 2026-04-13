@@ -46,8 +46,8 @@ class SyncCache(HiRadixCache):
 
         # Keep the knobs close to the old SyncCache behavior.
         self.prefill_sync_chunk_size = max(1, int(sync_params.chunked_prefill_size or 256))
-        self.decode_sync_stride_steps = 4
-        self.decode_sync_min_tokens = max(8, sync_params.page_size)
+        self.decode_sync_stride_steps = 64
+        self.decode_sync_min_tokens = max(64, sync_params.page_size)
 
     def _infer_seq_len(self, req: Req) -> int:
         fill_ids = getattr(req, "fill_ids", None)
