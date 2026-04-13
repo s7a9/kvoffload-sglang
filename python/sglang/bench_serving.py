@@ -126,6 +126,7 @@ class RequestFuncInput:
     extra_request_body: Dict[str, Any]
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
+    send_time: Optional[float] = None  # Time when request was sent (relative to benchmark start)
 
 
 @dataclass
@@ -140,6 +141,7 @@ class RequestFuncOutput:
     error: str = ""
     output_len: int = 0
     start_time: float = 0.0
+    send_time: float = 0.0  # Time when request was sent (relative to benchmark start)
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -308,6 +310,7 @@ async def async_request_openai_completions(
             headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
+        output.send_time = request_func_input.send_time or 0.0
 
         generated_text = ""
         output_len = request_func_input.output_len
@@ -460,6 +463,7 @@ async def async_request_openai_chat_completions(
             headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
+        output.send_time = request_func_input.send_time or 0.0
 
         generated_text = ""
         output_len = request_func_input.output_len
@@ -676,6 +680,7 @@ async def async_request_sglang_generate(
             headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
+        output.send_time = request_func_input.send_time or 0.0
 
         generated_text = ""
         output_len = request_func_input.output_len
@@ -1384,6 +1389,9 @@ async def benchmark(
 
     pbar = None if disable_tqdm else tqdm(total=pbar_total)
     async for request in request_generator:
+        # Record send time relative to benchmark start
+        request_send_time = time.perf_counter() - benchmark_start_time
+
         if lora_names is not None and len(lora_names) != 0:
             if lora_request_distribution == "uniform":
                 lora_name = random.choice(lora_names)
@@ -1414,6 +1422,7 @@ async def benchmark(
             extra_request_body=merged_extra_body,
             timestamp=request.timestamp,
             routing_key=request.routing_key,
+            send_time=request_send_time,
         )
 
         tasks.append(
@@ -1678,6 +1687,7 @@ async def benchmark(
         "output_lens": output_lens,
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
+        "send_times": [output.send_time for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
