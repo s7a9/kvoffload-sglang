@@ -2326,6 +2326,11 @@ class Scheduler(
     def _maybe_apply_offload_reschedule_policy(self, trigger_point: str) -> None:
         if self.offload_reschedule_policy is None:
             return
+        # If no decode batch between two consecutive offload reschedules, 
+        # the scheduler will be stuck. This is a simple fix.
+        if self.last_batch and self.last_batch.forward_mode.is_extend():
+            return
+
         now = time.time()
         self._decay_kv_offload_request_buffers(now=now)
         self._gc_kv_offload_request_state()
