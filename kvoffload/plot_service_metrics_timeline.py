@@ -232,6 +232,17 @@ def slice_timeline(
     return {key: [values[i] for i in indices] for key, values in timeline.items()}
 
 
+def format_method_label(tag: str) -> str:
+    """Map a benchmark tag to a compact method label for plots."""
+
+    tag_lower = str(tag).lower()
+    if tag_lower.endswith("-local") or "-local-" in tag_lower or "local" in tag_lower:
+        return "Tokenflow"
+    if tag_lower.endswith("-default") or "-default-" in tag_lower or "default" in tag_lower:
+        return "SGLang"
+    return str(tag)
+
+
 def load_records_by_tags(jsonl_path: Path, tags: List[str]) -> Dict[str, Dict]:
     """Load required experiment records by tag with one-pass streaming."""
     required = list(dict.fromkeys(tags))
@@ -265,9 +276,15 @@ def plot_metric(
     title: str,
     output_path: Path,
 ) -> None:
-    plt.figure(figsize=(7, 4))
+    plt.figure(figsize=(6, 3))
+    seen_labels: set[str] = set()
     for tag, timeline in timelines_by_tag.items():
-        plt.plot(timeline["time_s"], timeline[metric_key], linewidth=1.8, label=tag)
+        label = format_method_label(tag)
+        if label in seen_labels:
+            label = "_nolegend_"
+        else:
+            seen_labels.add(label)
+        plt.plot(timeline["time_s"], timeline[metric_key], linewidth=1.8, label=label)
 
     plt.title(title, fontsize=13, fontweight="bold")
     plt.xlabel("Time (s)")
