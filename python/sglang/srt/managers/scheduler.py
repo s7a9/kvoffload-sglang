@@ -718,14 +718,9 @@ class Scheduler(
             and server_args.disable_radix_cache
         ):
             if not self.is_hybrid_swa:
-                if _ENABLE_SYNC_CACHE:
-                    from sglang.srt.mem_cache.sync_cache import SyncCache
+                from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
-                    self.tree_cache = SyncCache(params=params, server_args=server_args)
-                else:
-                    from sglang.srt.mem_cache.chunk_cache import ChunkCache
-
-                    self.tree_cache = ChunkCache(params)
+                self.tree_cache = ChunkCache(params)
             else:
                 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
@@ -748,11 +743,16 @@ class Scheduler(
                         params=params, server_args=server_args
                     )
                 else:
-                    from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+                    if _ENABLE_SYNC_CACHE:
+                        from sglang.srt.mem_cache.sync_cache import SyncCache
 
-                    self.tree_cache = HiRadixCache(
-                        params=params, server_args=server_args
-                    )
+                        self.tree_cache = SyncCache(params=params, server_args=server_args)
+                    else:
+                        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+
+                        self.tree_cache = HiRadixCache(
+                            params=params, server_args=server_args
+                        )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
@@ -2448,11 +2448,7 @@ class Scheduler(
             # Release KV for removed running requests before filtering them out.
             for remove_ct, idx in enumerate(sorted(remove_indices, reverse=True)):
                 req: Req = running_reqs[idx]
-                if hasattr(self.tree_cache, "evict_device"):
-                    self.tree_cache.evict_device(req)
-                else:
-                    # Fallback path for non-sync caches.
-                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                release_kv_cache(req, self.tree_cache, is_insert=False)
                 req.reset_for_retract()
 
             if keep_indices:

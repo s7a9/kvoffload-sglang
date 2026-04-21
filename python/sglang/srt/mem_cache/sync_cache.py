@@ -40,14 +40,14 @@ class SyncCache(HiRadixCache):
             hicache_write_policy="write_through",
             hicache_storage_backend=None,
         )
-        super().__init__(params=sync_params, server_args=sync_server_args)
-
         self._req_states: Dict[str, SyncCacheReqState] = {}
 
         # Keep the knobs close to the old SyncCache behavior.
-        self.prefill_sync_chunk_size = max(1, int(sync_params.chunked_prefill_size or 256))
-        self.decode_sync_stride_steps = 64
-        self.decode_sync_min_tokens = max(64, sync_params.page_size)
+        self.prefill_sync_chunk_size = max(1, int(sync_params.chunked_prefill_size or 2048))
+        self.decode_sync_stride_steps = 512
+        self.decode_sync_min_tokens = max(512, sync_params.page_size)
+
+        super().__init__(params=sync_params, server_args=sync_server_args)
 
     def _infer_seq_len(self, req: Req) -> int:
         fill_ids = getattr(req, "fill_ids", None)
@@ -195,6 +195,8 @@ class SyncCache(HiRadixCache):
         self._free_unprotected_tail(req, target_len)
 
         self._req_states.pop(req.rid, None)
+
+        self.req_to_token_pool.free(req)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
         self._req_states.pop(req.rid, None)

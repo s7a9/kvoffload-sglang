@@ -166,12 +166,29 @@ class PaperV1OffloadReschedulePolicy(OffloadReschedulePolicy):
     def compute(
         self, snapshot: OffloadPolicyRuntimeSnapshot
     ) -> OffloadRescheduleDecision:
-        keep_running_list = self._select_keep_running_list(snapshot)
+        keep_running_list, keep_candidates = self._select_keep_running_list(snapshot)
         candidate_map = self._build_candidate_map(
             snapshot.waiting_reqs,
             snapshot.workload_snapshot,
             snapshot,
         )
+        # Inject keep_candidates into the candidate map with zero cost terms.
+        # These are running requests that *may* be evicted but compete in the
+        # objective search on equal footing (only token_value & buffer_penalty).
+        for req in keep_candidates:
+            terms_keep = self._estimate_terms(
+                req,
+                mode="keep",
+                workload_snapshot=snapshot.workload_snapshot,
+                snapshot=snapshot,
+            )
+            objective_keep = terms_keep["token_value"] - terms_keep["buffer_penalty"]
+            candidate_map[(req.rid, "keep")] = {
+                "req": req,
+                "objective": objective_keep,
+                "terms": terms_keep,
+            }
+
         greedy_order = self._greedy_select(candidate_map)
         objective_before_local_search = self._evaluate_order(greedy_order, candidate_map)
         refined_order = list(greedy_order)
@@ -179,7 +196,12 @@ class PaperV1OffloadReschedulePolicy(OffloadReschedulePolicy):
             refined_order = self._local_search(refined_order, candidate_map)
         objective_after_local_search = self._evaluate_order(refined_order, candidate_map)
 
-        load_list, prefill_list = self._materialize_decision_order(refined_order)
+        load_list, prefill_list, kept_from_candidates = (
+            self._materialize_decision_order(refined_order)
+        )
+
+        # Requests selected as "keep" stay in the running list.
+        final_keep_running_list = list(keep_running_list) + kept_from_candidates
 
         token_value_sum = 0.0
         load_cost_sum = 0.0
@@ -195,9 +217,11 @@ class PaperV1OffloadReschedulePolicy(OffloadReschedulePolicy):
             buffer_penalty_sum += terms["buffer_penalty"]
 
         objective = objective_after_local_search
-        evicted_running_count = float(max(len(snapshot.running_reqs) - len(keep_running_list), 0))
+        evicted_running_count = float(
+            max(len(snapshot.running_reqs) - len(final_keep_running_list), 0)
+        )
         return OffloadRescheduleDecision(
-            keep_running_list=keep_running_list,
+            keep_running_list=final_keep_running_list,
             new_load_list=load_list,
             new_prefill_list=prefill_list,
             objective_terms={
@@ -211,17 +235,26 @@ class PaperV1OffloadReschedulePolicy(OffloadReschedulePolicy):
                 "objective_after_local_search": objective_after_local_search,
                 "selected_load_count": float(len(load_list)),
                 "selected_prefill_count": float(len(prefill_list)),
+                "selected_keep_count": float(len(kept_from_candidates)),
                 "evicted_running_count": evicted_running_count,
-                **self._build_ibt_stats(snapshot, keep_running_list),
+                **self._build_ibt_stats(snapshot, final_keep_running_list),
             },
         )
 
     def _select_keep_running_list(
         self, snapshot: OffloadPolicyRuntimeSnapshot
-    ) -> List[Req]:
+    ) -> Tuple[List[Req], List[Req]]:
+        """Return (keep_list, keep_candidates).
+
+        *keep_list* — requests that unconditionally stay running.
+        *keep_candidates* — requests that *could* be evicted but are not
+        evicted outright.  Instead they participate in the objective search
+        (with zero load/evict/recompute cost) so the optimizer can decide
+        whether keeping them is more valuable than admitting a waiting request.
+        """
         running_reqs = list(snapshot.running_reqs)
         if len(running_reqs) <= 1 or len(snapshot.waiting_reqs) == 0:
-            return running_reqs
+            return running_reqs, []
 
         pause_time = self._estimate_pause_time(snapshot)
         threshold = pause_time * max(snapshot.buffer_conservativeness, self._EPS)
@@ -244,14 +277,16 @@ class PaperV1OffloadReschedulePolicy(OffloadReschedulePolicy):
             max(len(running_reqs) - 1, 0),
         )
         if max_swaps <= 0:
-            return running_reqs
+            return running_reqs, []
 
         evictable.sort(key=lambda x: (-x[0], x[1].rid))
-        swapped_out = {req for _, req in evictable[:max_swaps]}
+        # The top-max_swaps evictable requests become keep_candidates instead
+        # of being unconditionally evicted.
+        keep_candidates = [req for _, req in evictable[:max_swaps]]
         for req in running_reqs:
-            if req not in swapped_out and req not in keep_list:
+            if req not in set(keep_candidates) and req not in keep_list:
                 keep_list.append(req)
-        return keep_list
+        return keep_list, keep_candidates
 
     def _estimate_pause_time(self, snapshot: OffloadPolicyRuntimeSnapshot) -> float:
         interval = max(snapshot.reschedule_interval_s, 0.0)
@@ -392,8 +427,14 @@ class PaperV1OffloadReschedulePolicy(OffloadReschedulePolicy):
             + 0.1 * starvation_utility
         )
 
+        # "keep" mode: running requests competing in the objective search have
+        # no load/evict/recompute cost — they are already resident in GPU memory.
+        if mode == "keep":
+            load_cost = 0.0
+            evict_cost = 0.0
+            recompute_cost = 0.0
         # Stage 05 workload-driven costs (fall back to Stage 03 proxy if unavailable).
-        if workload_snapshot is not None and workload_snapshot.get(
+        elif workload_snapshot is not None and workload_snapshot.get(
             "workload_metrics_available", 0.0
         ) > 0:
             load_backlog = float(workload_snapshot.get("loading_backlog_tokens", 0.0))
@@ -420,10 +461,11 @@ class PaperV1OffloadReschedulePolicy(OffloadReschedulePolicy):
                 * float(getattr(req, "cache_protected_len", 0))
                 * write_pressure
             )
+            recompute_cost = self.delta * (recompute_span if mode == "prefill" else 0.0)
         else:
             load_cost = self.beta * (float(total_len) if mode == "load" else 0.0)
             evict_cost = self.gamma * float(getattr(req, "cache_protected_len", 0))
-        recompute_cost = self.delta * (recompute_span if mode == "prefill" else 0.0)
+            recompute_cost = self.delta * (recompute_span if mode == "prefill" else 0.0)
 
         extra_delay = 0.0
         if snapshot is not None:
@@ -504,15 +546,20 @@ class PaperV1OffloadReschedulePolicy(OffloadReschedulePolicy):
         return total
 
     @staticmethod
-    def _materialize_decision_order(order) -> Tuple[List[Req], List[Req]]:
+    def _materialize_decision_order(
+        order,
+    ) -> Tuple[List[Req], List[Req], List[Req]]:
         load_list: List[Req] = []
         prefill_list: List[Req] = []
+        kept_from_candidates: List[Req] = []
         for req, mode in order:
-            if mode == "load":
+            if mode == "keep":
+                kept_from_candidates.append(req)
+            elif mode == "load":
                 load_list.append(req)
             else:
                 prefill_list.append(req)
-        return load_list, prefill_list
+        return load_list, prefill_list, kept_from_candidates
 
 
 def create_offload_reschedule_policy(server_args: ServerArgs) -> OffloadReschedulePolicy:
