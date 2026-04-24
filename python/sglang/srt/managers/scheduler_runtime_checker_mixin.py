@@ -32,17 +32,13 @@ class SchedulerRuntimeCheckerMixin:
         waiting_ids = {req.rid for req in waiting_reqs}
 
         keep_running_ids = [req.rid for req in decision.keep_running_list]
-        load_ids = [req.rid for req in decision.new_load_list]
-        prefill_ids = [req.rid for req in decision.new_prefill_list]
+        resume_ids = [req.rid for req in decision.new_resume_list]
 
         if len(keep_running_ids) != len(set(keep_running_ids)):
             logger.warning("KV offload policy produced duplicate keep_running_list.")
             return False
-        if len(load_ids) != len(set(load_ids)):
-            logger.warning("KV offload policy produced duplicate new_load_list.")
-            return False
-        if len(prefill_ids) != len(set(prefill_ids)):
-            logger.warning("KV offload policy produced duplicate new_prefill_list.")
+        if len(resume_ids) != len(set(resume_ids)):
+            logger.warning("KV offload policy produced duplicate new_resume_list.")
             return False
 
         if not set(keep_running_ids).issubset(running_ids):
@@ -50,20 +46,9 @@ class SchedulerRuntimeCheckerMixin:
                 "KV offload policy keep_running_list is not a subset of running reqs."
             )
             return False
-        if not set(load_ids).issubset(waiting_ids):
+        if not set(resume_ids).issubset(waiting_ids):
             logger.warning(
-                "KV offload policy new_load_list is not a subset of waiting reqs."
-            )
-            return False
-        if not set(prefill_ids).issubset(waiting_ids):
-            logger.warning(
-                "KV offload policy new_prefill_list is not a subset of waiting reqs."
-            )
-            return False
-
-        if set(load_ids).intersection(prefill_ids):
-            logger.warning(
-                "KV offload policy new_load_list and new_prefill_list must be disjoint."
+                "KV offload policy new_resume_list is not a subset of waiting reqs."
             )
             return False
 

@@ -911,6 +911,11 @@ class Scheduler(
             and not self.server_args.disable_priority_preemption
         )
 
+        # Force priority preemption on for paper_v1 offload policy
+        if self.server_args.kv_offload_policy == "paper_v1":
+            self.enable_priority_preemption = True
+            self.enable_priority_scheduling = True
+
         self.init_new_token_ratio = min(
             envs.SGLANG_INIT_NEW_TOKEN_RATIO.get()
             * self.server_args.schedule_conservativeness,
@@ -925,14 +930,18 @@ class Scheduler(
         ) / envs.SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS.get()
         self.new_token_ratio = self.init_new_token_ratio
 
+        # Tick-based reschedule interval (deterministic across TP ranks).
         self.kv_offload_reschedule_interval = (
             self.server_args.kv_offload_reschedule_interval
         )
-        self.last_kv_offload_reschedule_time: Optional[float] = None
+        self.kv_offload_reschedule_tick_interval: int = max(
+            int(self.server_args.kv_offload_reschedule_interval), 1
+        )
+        self.last_kv_offload_reschedule_tick: int = 0
         self.offload_request_buffer_tokens: Dict[str, float] = {}
         self.offload_request_output_speeds: Dict[str, float] = {}
         self.offload_request_rebuffer_times: Dict[str, float] = {}
-        self.last_kv_offload_buffer_decay_time: Optional[float] = None
+        self.last_kv_offload_buffer_decay_tick: int = 0
         self.offload_reschedule_policy = None
         if self.server_args.kv_offload_policy != "default":
             self.offload_reschedule_policy = create_offload_reschedule_policy(
@@ -974,17 +983,27 @@ class Scheduler(
         self._ensure_kv_offload_request_state(req)
         self.offload_request_buffer_tokens[req.rid] += float(token_count)
 
-    def _decay_kv_offload_request_buffers(self, now: Optional[float] = None) -> None:
+    def _decay_kv_offload_request_buffers(self) -> None:
+        """Decay buffer tokens by one tick.
+
+        Uses schedule_tick (deterministic across TP ranks) instead of
+        wall-clock time to avoid divergence between processes.
+        Each tick is treated as one decode step; the effective seconds per
+        tick is estimated from the reschedule interval setting.
+        """
         if self.offload_reschedule_policy is None:
             return
-        if now is None:
-            now = time.time()
-        if self.last_kv_offload_buffer_decay_time is None:
-            self.last_kv_offload_buffer_decay_time = now
+        current_tick = self.schedule_tick
+        elapsed_ticks = current_tick - self.last_kv_offload_buffer_decay_tick
+        if elapsed_ticks <= 0:
             return
-        elapsed = now - self.last_kv_offload_buffer_decay_time
-        if elapsed <= 0:
-            return
+        self.last_kv_offload_buffer_decay_tick = current_tick
+
+        # Estimate seconds per tick from the reschedule interval.
+        seconds_per_tick = float(self.kv_offload_reschedule_interval) / max(
+            float(self.kv_offload_reschedule_tick_interval), 1.0
+        )
+        elapsed = float(elapsed_ticks) * seconds_per_tick
 
         for rid, cur_buffer in list(self.offload_request_buffer_tokens.items()):
             output_speed = self.offload_request_output_speeds.get(rid, 0.0)
@@ -997,8 +1016,6 @@ class Scheduler(
                     + (-next_buffer) / max(output_speed, 1e-6)
                 )
             self.offload_request_buffer_tokens[rid] = next_buffer
-
-        self.last_kv_offload_buffer_decay_time = now
 
     def _gc_kv_offload_request_state(self) -> None:
         if self.offload_reschedule_policy is None:
@@ -1999,6 +2016,7 @@ class Scheduler(
                 return
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
+            req.wait_queue_entry_tick = self.schedule_tick
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
@@ -2300,6 +2318,10 @@ class Scheduler(
         if self.running_batch.is_prefill_only:
             self.running_batch.filter_batch()
 
+        self._maybe_apply_offload_reschedule_policy(
+            trigger_point="get_next_batch_to_run"
+        )
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
         else:
@@ -2382,21 +2404,25 @@ class Scheduler(
     def _maybe_apply_offload_reschedule_policy(self, trigger_point: str) -> None:
         if self.offload_reschedule_policy is None:
             return
-        # If no decode batch between two consecutive offload reschedules, 
+        # If no decode batch between two consecutive offload reschedules,
         # the scheduler will be stuck. This is a simple fix.
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             return
 
-        now = time.time()
-        self._decay_kv_offload_request_buffers(now=now)
+        # Tick-based gating: deterministic across TP ranks.
         self._gc_kv_offload_request_state()
+        current_tick = self.schedule_tick
         if (
-            self.last_kv_offload_reschedule_time is not None
-            and now - self.last_kv_offload_reschedule_time
-            < self.kv_offload_reschedule_interval
+            current_tick - self.last_kv_offload_reschedule_tick
+            < self.kv_offload_reschedule_tick_interval
         ):
             return
-        self.last_kv_offload_reschedule_time = now
+        self.last_kv_offload_reschedule_tick = current_tick
+
+        # Populate prefix_indices and host_hit_length on waiting requests
+        # so the policy sees accurate GPU-hit / host-hit / uncached breakdowns.
+        for req in self.waiting_queue:
+            req.init_next_round_input(self.tree_cache)
 
         num_used, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.max_total_num_tokens - (
@@ -2426,18 +2452,15 @@ class Scheduler(
         ):
             return
 
-        moved_from_running = self._apply_offload_reschedule_decision(decision)
+        self._apply_offload_reschedule_decision(decision)
 
         if _KV_OFFLOAD_POLICY_DEBUG_LOG:
             logger.info(
-                "[KV Offload Policy] tick=%d point=%s running=%d keep_running=%d load=%d prefill=%d moved_from_running=%d terms=%s",
+                "[KV Offload Policy] tick=%d point=%s running=%d resume=%d terms=%s",
                 self.schedule_tick,
                 trigger_point,
                 len(self.running_batch.reqs),
-                len(decision.keep_running_list),
-                len(decision.new_load_list),
-                len(decision.new_prefill_list),
-                moved_from_running,
+                len(decision.new_resume_list),
                 decision.objective_terms,
             )
 
@@ -2489,62 +2512,37 @@ class Scheduler(
             "pending_load_acks": float(pending_load_acks),
         }
 
-    def _apply_offload_reschedule_decision(self, decision) -> int:
-        """Apply keep/load/prefill decisions with queue migration and safe KV release."""
-        moved_from_running = 0
+    def _apply_offload_reschedule_decision(self, decision) -> None:
+        """Apply priority assignments and reorder the waiting queue.
 
-        running_reqs = self.running_batch.reqs
-        keep_running_set = set(decision.keep_running_list)
-        keep_indices = [i for i, req in enumerate(running_reqs) if req in keep_running_set]
-        remove_indices = [i for i, req in enumerate(running_reqs) if req not in keep_running_set]
+        This method does NOT evict running requests.  Preemption is handled
+        by the existing priority-based preemption in PrefillAdder.
+        """
+        # Set priority from request_objectives for priority-based preemption.
+        if decision.request_objectives:
+            for req in decision.new_resume_list:
+                if req.rid in decision.request_objectives:
+                    req.priority = decision.request_objectives[req.rid]
+            for req in decision.keep_running_list:
+                if req.rid in decision.request_objectives:
+                    req.priority = decision.request_objectives[req.rid]
 
-        removed_running_reqs: List[Req] = [running_reqs[i] for i in remove_indices]
-        if remove_indices:
-            moved_from_running = len(remove_indices)
-            # Release KV for removed running requests before filtering them out.
-            for remove_ct, idx in enumerate(sorted(remove_indices, reverse=True)):
-                req: Req = running_reqs[idx]
-                release_kv_cache(req, self.tree_cache, is_insert=False)
-                req.reset_for_retract()
-
-            if keep_indices:
-                self.running_batch.filter_batch(keep_indices=keep_indices)
-            else:
-                self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
-
-        # Build explicit decision groups for waiting requests.
+        # Reorder waiting queue: resume list first, then remaining.
         waiting_set = set(self.waiting_queue)
-        ordered_load: List[Req] = []
-        ordered_prefill: List[Req] = []
         seen_waiting: Set[Req] = set()
+        ordered_resume: List[Req] = []
 
-        for req in decision.new_load_list:
+        for req in decision.new_resume_list:
             if req in waiting_set and req not in seen_waiting:
-                ordered_load.append(req)
+                ordered_resume.append(req)
                 seen_waiting.add(req)
 
-        for req in decision.new_prefill_list:
-            if req in waiting_set and req not in seen_waiting:
-                # Force recompute path semantics for selected prefill candidates.
-                if len(req.output_ids) > 0:
-                    req.reset_for_retract()
-                ordered_prefill.append(req)
-                seen_waiting.add(req)
-
-        # Requests removed from running but not explicitly selected default to load path.
-        selected_rids = {req.rid for req in decision.new_load_list + decision.new_prefill_list}
-        for req in removed_running_reqs:
-            if req.rid in selected_rids:
-                continue
-            ordered_load.append(req)
-
-        ordered_waiting: List[Req] = ordered_load + ordered_prefill
+        ordered_waiting: List[Req] = ordered_resume
         for req in self.waiting_queue:
             if req not in seen_waiting:
                 ordered_waiting.append(req)
 
         self.waiting_queue = ordered_waiting
-        return moved_from_running
 
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
@@ -2581,10 +2579,6 @@ class Scheduler(
         ):
             self.running_batch.batch_is_full = True
             return None
-
-        self._maybe_apply_offload_reschedule_policy(
-            trigger_point="before_prefill_candidate"
-        )
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, self.running_batch)
@@ -2842,10 +2836,6 @@ class Scheduler(
                 self.new_token_ratio - self.new_token_ratio_decay,
                 self.min_new_token_ratio,
             )
-
-        self._maybe_apply_offload_reschedule_policy(
-            trigger_point="after_decode_memory_check"
-        )
 
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False

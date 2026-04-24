@@ -5,15 +5,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 TAG="${TAG:-}"
-MODEL_PATH="${MODEL_PATH:-/storage/nas/dch/models/Qwen--Qwen3-4B-Instruct-2507}"
+MODEL_PATH="${MODEL_PATH:-MiniMaxAI/MiniMax-M2.77}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-30000}"
-TP_SIZE="${TP_SIZE:-1}"
+TP_SIZE="${TP_SIZE:-8}"
+EP_SIZE="${EP_SIZE:-8}"
 DTYPE="${DTYPE:-auto}"
 
-PAPER_V1_ATTENTION_BACKEND="${PAPER_V1_ATTENTION_BACKEND:-fa3}"
 KV_OFFLOAD_POLICY="${KV_OFFLOAD_POLICY:-paper_v1}"
-export SGLANG_ENABLE_SYNC_CACHE="1"
+# export SGLANG_ENABLE_SYNC_CACHE="1"
+# export SGLANG_KV_OFFLOAD_POLICY_DEBUG_LOG=1
 
 cd "${REPO_ROOT}"
 
@@ -23,10 +24,15 @@ CMD=(
 	--host "${HOST}"
 	--port "${PORT}"
 	--tp-size "${TP_SIZE}"
+	--ep-size "${EP_SIZE:-1}"
 	--dtype "${DTYPE}"
-	--attention-backend "${PAPER_V1_ATTENTION_BACKEND}"
 	--kv-offload-policy "${KV_OFFLOAD_POLICY}"
 	--enable-hierarchical-cache
+	--trust-remote-code
+    --tool-call-parser minimax-m2
+    --reasoning-parser minimax-append-think
+	--hicache-size 20
+	--max-running-requests 128
 )
 
 if [[ -n "${TAG}" ]]; then

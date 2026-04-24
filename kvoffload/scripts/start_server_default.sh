@@ -5,10 +5,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 TAG="${TAG:-}"
-MODEL_PATH="${MODEL_PATH:-/storage/nas/dch/models/Qwen--Qwen3-4B-Instruct-2507}"
+MODEL_PATH="${MODEL_PATH:-MiniMaxAI/MiniMax-M2.7}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-30000}"
-TP_SIZE="${TP_SIZE:-1}"
+TP_SIZE="${TP_SIZE:-8}"
+EP_SIZE="${EP_SIZE:-8}"
 DTYPE="${DTYPE:-auto}"
 
 cd "${REPO_ROOT}"
@@ -19,7 +20,12 @@ CMD=(
 	--host "${HOST}"
 	--port "${PORT}"
 	--tp-size "${TP_SIZE}"
+	--ep-size "${EP_SIZE:-1}"
 	--dtype "${DTYPE}"
+	--trust-remote-code
+    --tool-call-parser minimax-m2
+    --reasoning-parser minimax-append-think
+	--max-running-requests 128
 )
 
 if [[ -n "${TAG}" ]]; then

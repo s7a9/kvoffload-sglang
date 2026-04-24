@@ -144,32 +144,6 @@ def build_token_arrival_df(rec: Dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def parse_tag(tag: str) -> Dict[str, str]:
-    """Parse tag to extract setting and method."""
-    # default-i1024o1024-rate1 -> setting: i1024o1024-rate1, method: default
-    # local-speed15-i1024o1024-rate1 -> setting: i1024o1024-rate1, method: local-speed15
-
-    if tag.startswith("default-"):
-        match = re.match(r"default-(i\d+o\d+)-(rate\d+|burst)", tag)
-        if match:
-            return {
-                "setting": f"{match.group(1)}-{match.group(2)}",
-                "method": "default",
-                "method_label": "Default (no KV offload)"
-            }
-    elif tag.startswith("local-"):
-        match = re.match(r"local-speed(\d+)-(i\d+o\d+)-(rate\d+|burst)", tag)
-        if match:
-            speed = match.group(1)
-            return {
-                "setting": f"{match.group(2)}-{match.group(3)}",
-                "method": f"local-speed{speed}",
-                "method_label": f"Local search (speed {speed} tok/s)"
-            }
-
-    return {}
-
-
 def _safe_name(text: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]+", "_", text).strip("_") or "untitled"
 
@@ -337,13 +311,11 @@ def main() -> None:
         experiments_by_setting = defaultdict(list)
         for rec in experiments:
             tag = rec.get("tag", "")
-            parsed = parse_tag(tag)
-            if parsed:
-                experiments_by_setting[parsed["setting"]].append({
-                    "record": rec,
-                    "method": parsed["method"],
-                    "method_label": parsed["method_label"]
-                })
+            experiments_by_setting[tag].append({
+                "record": rec,
+                "method": tag,
+                "method_label": tag
+            })
 
         print(f"\nGenerating grouped timeline plots for {len(experiments_by_setting)} settings...")
         plot_grouped_timelines(experiments_by_setting, plot_dir)
