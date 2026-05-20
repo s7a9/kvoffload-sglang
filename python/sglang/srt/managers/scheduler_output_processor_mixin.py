@@ -180,6 +180,109 @@ class SchedulerOutputProcessorMixin:
                 if req.is_chunked <= 0:
                     req.time_stats.set_prefill_finished_time()
 
+                    # C2KV multi-round prefill: inject gist segments and maybe re-queue
+                    if req.c2kv_rounds is not None:
+                        cur_round = req.c2kv_rounds[req.c2kv_round_idx]
+                        self._log_c2kv_token_usage(
+                            "prefill_round_finished",
+                            req=req,
+                            batch_seq_len=int(batch.seq_lens_cpu[i].item()),
+                            post_inject=list(cur_round.post_inject_seg_indices),
+                        )
+
+                        # Inject all gist segments scheduled after this round
+                        abort = False
+                        logical_kv_start = int(batch.seq_lens_cpu[i].item())
+                        for seg_idx in cur_round.post_inject_seg_indices:
+                            if not self._inject_c2kv_gist_segment(
+                                req, seg_idx, logical_kv_start
+                            ):
+                                logger.warning(
+                                    f"C2KV injection failed for {req.rid}; aborting"
+                                )
+                                from sglang.srt.managers.schedule_batch import FINISH_ABORT as _FA
+
+                                req.to_finish = _FA("C2KV injection failed")
+                                if req.c2kv_full_origin_input_ids is not None:
+                                    committed_virtual_ids = list(
+                                        req.c2kv_full_origin_input_ids[
+                                            : req.kv_committed_len
+                                        ]
+                                    )
+                                    req.origin_input_ids = committed_virtual_ids
+                                    req.fill_ids = committed_virtual_ids
+                                req.check_finished()
+                                self._log_c2kv_token_usage(
+                                    "inject_abort_release_before",
+                                    req=req,
+                                    failed_seg_idx=seg_idx,
+                                )
+                                release_kv_cache(req, self.tree_cache, is_insert=False)
+                                self._log_c2kv_token_usage(
+                                    "inject_abort_release_after",
+                                    req=req,
+                                    failed_seg_idx=seg_idx,
+                                )
+                                self.stream_output([req], req.return_logprob)
+                                abort = True
+                                break
+                            logical_kv_start = req.kv_committed_len
+                        if abort:
+                            continue
+
+                        req.c2kv_round_idx += 1
+
+                        if req.c2kv_round_idx < len(req.c2kv_rounds):
+                            next_round = req.c2kv_rounds[req.c2kv_round_idx]
+                            model_runner = self.tp_worker.model_runner
+
+                            req.prefix_indices = (
+                                model_runner.req_to_token_pool.req_to_token[
+                                    req.req_pool_idx, : req.kv_committed_len
+                                ].to(torch.int64)
+                            )
+                            req.already_computed = req.kv_committed_len
+
+                            # Only the next round's real tokens
+                            req.origin_input_ids = list(next_round.tokens)
+
+                            # Release the tree lock from this round's PrefillAdder;
+                            # the next round's PrefillAdder will re-acquire it.
+                            if req.last_node is not None:
+                                self.tree_cache.dec_lock_ref(req.last_node)
+
+                            self._log_c2kv_token_usage(
+                                "requeue_next_round",
+                                req=req,
+                                next_round_idx=req.c2kv_round_idx,
+                                next_round_len=len(next_round.tokens),
+                            )
+
+                            req.c2kv_requeued = True
+                            self.waiting_queue.insert(0, req)
+                            continue
+
+                        # Last round done — restore full virtual sequence for decode
+                        if req.c2kv_full_origin_input_ids is not None:
+                            req.origin_input_ids = list(req.c2kv_full_origin_input_ids)
+                            req.fill_ids = list(req.c2kv_full_origin_input_ids)
+
+                        # If gist was injected this round, batch.seq_lens is stale.
+                        # Patch it so decode allocates at the correct position.
+                        if cur_round.post_inject_seg_indices:
+                            gist_delta = req.kv_committed_len - int(
+                                batch.seq_lens_cpu[i].item()
+                            )
+                            if gist_delta > 0:
+                                batch.seq_lens[i] += gist_delta
+                                batch.seq_lens_cpu[i] += gist_delta
+
+                        self._log_c2kv_token_usage(
+                            "all_rounds_finished",
+                            req=req,
+                            batch_seq_len=int(batch.seq_lens_cpu[i].item()),
+                        )
+
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
 

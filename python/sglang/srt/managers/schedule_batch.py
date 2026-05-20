@@ -554,6 +554,16 @@ class MultimodalInputs:
         # other args would be kept intact
 
 
+class C2KVPrefillRound:
+    """One round of C2KV multi-round prefill."""
+
+    __slots__ = ("tokens", "post_inject_seg_indices")
+
+    def __init__(self, tokens: List[int], post_inject_seg_indices: List[int]):
+        self.tokens = tokens
+        self.post_inject_seg_indices = post_inject_seg_indices
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -875,6 +885,14 @@ class Req(ReqDllmMixin):
         # For hisparse
         self.hisparse_staging = False
 
+        # C2KV multi-round prefill state
+        self.c2kv_segments = None           # List[C2KVSegmentInfo], sorted by token_start
+        self.c2kv_rounds = None             # List[C2KVPrefillRound]
+        self.c2kv_round_idx = 0
+        self.c2kv_position_correction = 0  # running sum: original_seq_len - gist_len
+        self.c2kv_full_origin_input_ids = None  # virtual token IDs including gist synthetic IDs
+        self.c2kv_requeued = False              # True while waiting for next round
+
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
@@ -942,6 +960,21 @@ class Req(ReqDllmMixin):
         tree_cache: Optional[BasePrefixCache] = None,
         cow_mamba: Optional[bool] = None,
     ):
+        # C2KV multi-round: only during active rounds (not after completion).
+        # prefix_indices was set by re-queue code; skip tree_cache match.
+        if (
+            self.c2kv_rounds is not None
+            and 0 < self.c2kv_round_idx < len(self.c2kv_rounds)
+        ):
+            self.c2kv_requeued = False
+            prefix_len = len(self.prefix_indices)
+            self.fill_ids = (
+                list(self.c2kv_full_origin_input_ids[:prefix_len])
+                + list(self.origin_input_ids)
+            )
+            self.set_extend_input_len(len(self.origin_input_ids))
+            return
+
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
@@ -1889,9 +1922,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         delta = 0 if self.enable_overlap else -1
 
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
+        # For C2KV requests, origin_input_ids doesn't account for gist KV slots;
+        # use kv_committed_len which does.
         self.prefix_lens.extend(
             [
-                len(r.origin_input_ids) + len(r.output_ids) + delta
+                (r.kv_committed_len + delta)
+                if getattr(r, "c2kv_position_correction", 0) > 0
+                else (len(r.origin_input_ids) + len(r.output_ids) + delta)
                 for r in running_batch.reqs
             ]
         )
@@ -2199,6 +2236,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
                 and self.reqs[i] not in chunked_req_to_exclude
+                and not getattr(self.reqs[i], "c2kv_requeued", False)
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
@@ -2333,6 +2371,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             seq_lens_cpu_cache if seq_lens_cpu_cache is not None else self.seq_lens_cpu
         )
 
+        c2kv_corr = None
+        if any(getattr(r, "c2kv_position_correction", 0) for r in self.reqs):
+            c2kv_corr = [
+                getattr(r, "c2kv_position_correction", 0) for r in self.reqs
+            ]
+
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
             input_ids=self.input_ids,
@@ -2390,6 +2434,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            c2kv_position_corrections=c2kv_corr,
         )
 
     def copy(self):
@@ -2577,3 +2622,6 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+
+    # C2KV position corrections per request
+    c2kv_position_corrections: Optional[List[int]] = None

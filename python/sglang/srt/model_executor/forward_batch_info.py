@@ -426,6 +426,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hisparse
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
+    # For C2KV extraction
+    c2kv_position_corrections: Optional[torch.Tensor] = None  # (batch_size,) int64
+
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
 
@@ -578,6 +581,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret._compute_spec_mrope_positions(model_runner, batch)
             else:
                 ret._compute_mrope_positions(model_runner, batch)
+
+        # C2KV position corrections: shift positions by the original-compressed gap
+        if batch.c2kv_position_corrections is not None:
+            corr = torch.tensor(
+                batch.c2kv_position_corrections, dtype=torch.int64, device=device
+            )
+            if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
+                ret.positions = ret.positions + corr
+            elif ret.positions is not None and batch.extend_seq_lens is not None:
+                ext_lens = torch.tensor(
+                    batch.extend_seq_lens, dtype=torch.int32, device=device
+                )
+                per_token_corr = torch.repeat_interleave(corr, ext_lens)
+                ret.positions = ret.positions + per_token_corr
 
         # Precompute SWA cache location once for all SWA layers
         if model_runner.is_hybrid_swa and ret.out_cache_loc is not None:

@@ -241,6 +241,9 @@ class GenerateReqInput(BaseReq):
 
     # Multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None
+
+    # C2KV: per-segment descriptors for gist injection
+    c2kv_segments: Optional[List] = None  # List[C2KVSegmentInfo]
     min_dynamic_patch: Optional[int] = None
     image_max_dynamic_patch: Optional[int] = None
     video_max_dynamic_patch: Optional[int] = None
@@ -750,6 +753,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # For observability
     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
+
+    # C2KV: per-segment descriptors for gist injection
+    c2kv_segments: Optional[List] = None  # List[C2KVSegmentInfo]
 
 
 @dataclass
@@ -1932,6 +1938,35 @@ class DumperControlReqOutput(BaseReq):
     success: bool
     response: List[Dict[str, Any]]
     error: str = ""
+
+
+class C2KVSegmentInfo:
+    """Describes one C2KV-compressed segment within a generation request."""
+
+    def __init__(self, key_hash: str = "", token_start: int = 0, token_end: int = 0):
+        self.key_hash = key_hash
+        self.token_start = token_start
+        self.token_end = token_end
+
+
+@dataclass
+class TokenizedExtractReqInput(BaseReq):
+    """Internal request type for a C2KV gist extraction job."""
+
+    input_ids: List[int] = field(default_factory=list)
+    input_text: str = ""
+    compression_ratio: int = 4
+
+
+@dataclass
+class C2KVExtractReqOutput(BaseReq):
+    """Output returned from handle_extract_request."""
+
+    key_hash: str = ""
+    gist_len: int = 0
+    original_seq_len: int = 0
+    error: str = ""
+    success: bool = True
 
 
 def _check_all_req_types():

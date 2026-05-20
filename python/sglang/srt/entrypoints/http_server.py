@@ -79,6 +79,8 @@ from sglang.srt.entrypoints.ollama.protocol import (
 )
 from sglang.srt.entrypoints.ollama.serving import OllamaServing
 from sglang.srt.entrypoints.openai.protocol import (
+    C2KVExtractRequest,
+    C2KVExtractResponse,
     ChatCompletionRequest,
     ClassifyRequest,
     CompletionRequest,
@@ -1393,6 +1395,53 @@ async def openai_v1_chat_completions(
     return await raw_request.app.state.openai_serving_chat.handle_request(
         request, raw_request
     )
+
+
+@app.post("/v1/c2kv/extract")
+async def v1_c2kv_extract(
+    request: C2KVExtractRequest, raw_request: Request
+) -> C2KVExtractResponse:
+    """Extract and store C2KV gist KV cache for a document."""
+    try:
+        tokenizer_manager = _global_state.tokenizer_manager
+        tokenizer = tokenizer_manager.tokenizer
+
+        if request.role:
+            # Compute the exact tokens this message contributes when placed in a
+            # non-first position, matching _compute_c2kv_segments which uses
+            # full_ids[len(prev_ids):] for message i > 0.
+            dummy_role = "system" if request.role != "system" else "user"
+            dummy = [{"role": dummy_role, "content": "x"}]
+            target = [{"role": request.role, "content": request.text}]
+            prev_ids = tokenizer.apply_chat_template(
+                dummy, tokenize=True, add_generation_prompt=False
+            )['input_ids']
+            full_ids = tokenizer.apply_chat_template(
+                dummy + target, tokenize=True, add_generation_prompt=False
+            )['input_ids']
+            input_ids = list(full_ids[len(prev_ids):])
+        else:
+            input_ids = tokenizer.encode(request.text)
+            if not isinstance(input_ids, list):
+                input_ids = list(input_ids)
+
+        result = await tokenizer_manager.c2kv_extract(
+            input_ids=input_ids,
+            input_text=request.text,
+            compression_ratio=request.compression_ratio,
+        )
+        return C2KVExtractResponse(
+            key_hash=result.key_hash,
+            gist_len=result.gist_len,
+            original_seq_len=result.original_seq_len,
+            success=result.success,
+            error=result.error or None,
+        )
+    except Exception as e:
+        return C2KVExtractResponse(
+            key_hash="", gist_len=0, original_seq_len=0,
+            success=False, error=str(e),
+        )
 
 
 @app.post(

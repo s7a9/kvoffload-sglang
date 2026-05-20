@@ -496,6 +496,7 @@ class ChatCompletionMessageGenericParam(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    c2kv_key_hash: Optional[str] = None
 
     @field_validator("role", mode="before")
     @classmethod
@@ -513,6 +514,7 @@ class ChatCompletionMessageGenericParam(BaseModel):
 class ChatCompletionMessageUserParam(BaseModel):
     role: Literal["user"]
     content: Union[str, List[ChatCompletionMessageContentPart]]
+    c2kv_key_hash: Optional[str] = None
 
 
 ChatCompletionMessageParam = Union[
@@ -1501,3 +1503,21 @@ class TranscriptionStreamResponse(BaseModel):
     model: str
     choices: List[TranscriptionStreamChoice]
     usage: Optional[UsageInfo] = None
+
+
+class C2KVExtractRequest(BaseModel):
+    """Request to extract and store gist KV for a document."""
+
+    text: str
+    compression_ratio: int = Field(default=4)
+    role: Optional[str] = None
+
+
+class C2KVExtractResponse(BaseModel):
+    """Response from a C2KV gist extraction."""
+
+    key_hash: str
+    gist_len: int
+    original_seq_len: int
+    success: bool = True
+    error: Optional[str] = None

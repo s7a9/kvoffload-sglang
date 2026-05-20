@@ -132,6 +132,7 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqInput,
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
+    TokenizedExtractReqInput,
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
@@ -181,7 +182,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 from sglang.srt.managers.session_controller import SessionController
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.common import evict_from_tree_cache, release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
@@ -822,6 +823,15 @@ class Scheduler(
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
             self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
+        self.c2kv_pool = None
+        if server_args.enable_c2kv:
+            from sglang.srt.mem_cache.c2kv_pool import C2KVPool
+
+            self.c2kv_pool = C2KVPool(max_total_tokens=server_args.c2kv_pool_size)
+            logger.info(
+                f"C2KV pool initialised (max_total_tokens={server_args.c2kv_pool_size})"
+            )
+
         if (
             server_args.disaggregation_mode == "decode"
             and server_args.disaggregation_decode_enable_offload_kvcache
@@ -1203,6 +1213,7 @@ class Scheduler(
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
+                (TokenizedExtractReqInput, self.handle_extract_request),
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
@@ -1343,6 +1354,22 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            # C2KV multi-round prefill: process_batch_result must run before
+            # get_next_batch_to_run so that c2kv_requeued is set and filter_batch
+            # correctly excludes the request from being merged into running_batch.
+            c2kv_early_process = (
+                self.last_batch
+                and len(self.result_queue) > 0
+                and any(
+                    getattr(r, "c2kv_rounds", None) is not None
+                    and getattr(r, "c2kv_round_idx", 0)
+                    < len(r.c2kv_rounds) - 1
+                    for r in self.last_batch.reqs
+                )
+            )
+            if c2kv_early_process:
+                pop_and_process()
+
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1350,7 +1377,7 @@ class Scheduler(
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
-            if disable_overlap_for_batch:
+            if disable_overlap_for_batch and not c2kv_early_process:
                 pop_and_process()
 
             # Launch the current batch
@@ -1362,10 +1389,10 @@ class Scheduler(
                 self.cancel_bubble_timer()
 
             # Process the last batch
-            if self.last_batch:
+            if self.last_batch and not c2kv_early_process:
                 if not disable_overlap_for_batch:
                     pop_and_process()
-            elif batch is None:
+            elif batch is None and not self.last_batch:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
@@ -1893,9 +1920,387 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if getattr(recv_req, "c2kv_segments", None):
+            req.c2kv_segments = recv_req.c2kv_segments
+            self._log_c2kv_token_usage(
+                "generate_before_build_rounds",
+                req=req,
+                full_prompt_len=len(req.origin_input_ids),
+                num_segments=len(req.c2kv_segments),
+            )
+            self._build_c2kv_prefill_rounds(req)
+            self._log_c2kv_token_usage(
+                "generate_after_build_rounds",
+                req=req,
+                full_prompt_len=len(req.c2kv_full_origin_input_ids or []),
+                round_lens=[len(round_info.tokens) for round_info in req.c2kv_rounds],
+                post_inject=[
+                    list(round_info.post_inject_seg_indices)
+                    for round_info in req.c2kv_rounds
+                ],
+            )
+
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
+
+    def _log_c2kv_token_usage(self, event: str, req: Optional["Req"] = None, **kwargs):
+        try:
+            log_fields = {
+                "event": event,
+                "available_size": self.token_to_kv_pool_allocator.available_size(),
+                "evictable_size": self.tree_cache.evictable_size(),
+                "protected_size": self.tree_cache.protected_size(),
+                "session_held": self._session_held_tokens(),
+            }
+            if self.c2kv_pool is not None:
+                log_fields.update(
+                    {
+                        "c2kv_pool_tokens": self.c2kv_pool.current_tokens(),
+                        "c2kv_pool_entries": self.c2kv_pool.num_entries(),
+                    }
+                )
+            if req is not None:
+                log_fields.update(
+                    {
+                        "rid": req.rid,
+                        "kv_committed_len": req.kv_committed_len,
+                        "kv_allocated_len": req.kv_allocated_len,
+                        "cache_protected_len": req.cache_protected_len,
+                        "prefix_len": len(req.prefix_indices),
+                        "origin_len": len(req.origin_input_ids),
+                        "fill_len": len(req.fill_ids),
+                        "output_len": len(req.output_ids),
+                        "c2kv_round_idx": req.c2kv_round_idx,
+                        "num_c2kv_rounds": (
+                            len(req.c2kv_rounds)
+                            if req.c2kv_rounds is not None
+                            else 0
+                        ),
+                    }
+                )
+            log_fields.update(kwargs)
+            logger.info(
+                "[C2KV token] "
+                + ", ".join(f"{key}={value}" for key, value in log_fields.items())
+            )
+        except Exception:
+            logger.debug("Failed to log C2KV token usage", exc_info=True)
+
+    def handle_extract_request(self, recv_req: "TokenizedExtractReqInput"):
+        from sglang.srt.managers.io_struct import C2KVExtractReqOutput
+
+        if self.c2kv_pool is None:
+            return C2KVExtractReqOutput(
+                error="C2KV not enabled.", success=False
+            )
+
+        if not recv_req.input_ids:
+            return C2KVExtractReqOutput(
+                error="input_ids is empty.", success=False
+            )
+
+        key_hash = self.c2kv_pool.compute_hash(recv_req.input_ids)
+        self._log_c2kv_token_usage(
+            "extract_request",
+            key_hash=key_hash[:16],
+            input_len=len(recv_req.input_ids),
+            compression_ratio=recv_req.compression_ratio,
+        )
+
+        existing = self.c2kv_pool.get(key_hash)
+        if existing is not None:
+            self._log_c2kv_token_usage(
+                "extract_cache_hit",
+                key_hash=key_hash[:16],
+                input_len=len(recv_req.input_ids),
+                gist_len=existing.gist_len,
+            )
+            return C2KVExtractReqOutput(
+                key_hash=key_hash,
+                gist_len=existing.gist_len,
+                original_seq_len=existing.original_seq_len,
+            )
+
+        input_ids = torch.tensor(
+            [recv_req.input_ids], dtype=torch.long, device="cuda"
+        )
+        attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        try:
+            gist_key_values, gist_mask, gist_position_ids = (
+                self.tp_worker.model_runner.forward_c2kv_extract(
+                    input_ids, attention_mask, recv_req.compression_ratio
+                )
+            )
+        except Exception as e:
+            logger.error(f"C2KV extract failed: {e}")
+            # print the stack trace
+            import traceback
+            traceback.print_exc()
+            import sys
+            print(sys.exc_info())
+            return C2KVExtractReqOutput(error=str(e), success=False)
+
+        original_seq_len = len(recv_req.input_ids)
+        entry = self.c2kv_pool.store(
+            key_hash=key_hash,
+            gist_key_values=gist_key_values,
+            gist_mask=gist_mask,
+            gist_position_ids=gist_position_ids,
+            original_seq_len=original_seq_len,
+        )
+        self._log_c2kv_token_usage(
+            "extract_store",
+            key_hash=key_hash[:16],
+            original_seq_len=original_seq_len,
+            gist_len=entry.gist_len,
+        )
+        return C2KVExtractReqOutput(
+            key_hash=key_hash,
+            gist_len=entry.gist_len,
+            original_seq_len=original_seq_len,
+        )
+
+    def _build_c2kv_prefill_rounds(self, req: "Req") -> None:
+        if not req.c2kv_segments:
+            return
+
+        from sglang.srt.managers.schedule_batch import C2KVPrefillRound
+        from sglang.srt.mem_cache.c2kv_pool import c2kv_gist_token_ids
+
+        original_input_ids = list(req.origin_input_ids)
+        original_len = len(original_input_ids)
+        segments = sorted(req.c2kv_segments, key=lambda s: s.token_start)
+        req.c2kv_segments = segments
+
+        prev_end = 0
+        for seg in segments:
+            if not (0 <= seg.token_start <= seg.token_end <= original_len):
+                raise ValueError(
+                    "Invalid C2KV segment boundary: "
+                    f"{seg.token_start=}, {seg.token_end=}, {original_len=}"
+                )
+            if seg.token_start < prev_end:
+                raise ValueError(
+                    "Overlapping C2KV segments are not supported: "
+                    f"{seg.token_start=} < previous token_end {prev_end}"
+                )
+            prev_end = seg.token_end
+
+        rounds: list = []
+        virtual_ids: list = []
+        pending_seg_indices: list = []
+        cursor = 0
+
+        for seg_idx, seg in enumerate(segments):
+            normal_tokens = original_input_ids[cursor : seg.token_start]
+            if normal_tokens:
+                rounds.append(
+                    C2KVPrefillRound(normal_tokens, list(pending_seg_indices))
+                )
+                pending_seg_indices = []
+                virtual_ids.extend(normal_tokens)
+
+            entry = self.c2kv_pool.get(seg.key_hash) if self.c2kv_pool else None
+            if entry is not None:
+                virtual_ids.extend(c2kv_gist_token_ids(seg.key_hash, entry.gist_len))
+
+            if rounds:
+                rounds[-1].post_inject_seg_indices.append(seg_idx)
+            else:
+                pending_seg_indices.append(seg_idx)
+
+            cursor = seg.token_end
+
+        remaining = original_input_ids[cursor:]
+        if remaining:
+            rounds.append(C2KVPrefillRound(remaining, list(pending_seg_indices)))
+            virtual_ids.extend(remaining)
+        elif pending_seg_indices and rounds:
+            rounds[-1].post_inject_seg_indices.extend(pending_seg_indices)
+
+        req.c2kv_rounds = rounds
+        req.c2kv_round_idx = 0
+        req.c2kv_full_origin_input_ids = virtual_ids
+
+        self._log_c2kv_token_usage(
+            "build_rounds",
+            req=req,
+            original_len=original_len,
+            virtual_len=len(virtual_ids),
+            segment_spans=[
+                (segment.key_hash[:16], segment.token_start, segment.token_end)
+                for segment in segments
+            ],
+            round_lens=[len(round_info.tokens) for round_info in rounds],
+            post_inject=[
+                list(round_info.post_inject_seg_indices) for round_info in rounds
+            ],
+        )
+
+        if rounds and rounds[0].tokens:
+            req.origin_input_ids = rounds[0].tokens
+            req.fill_ids = list(rounds[0].tokens)
+
+    def _inject_c2kv_gist_segment(
+        self, req: "Req", seg_idx: int, logical_kv_start: Optional[int] = None
+    ) -> bool:
+        """Returns True on success, False on any failure (caller should abort req)."""
+        seg = req.c2kv_segments[seg_idx]
+        if self.c2kv_pool is None:
+            return False
+
+        entry = self.c2kv_pool.get(seg.key_hash)
+        if entry is None:
+            logger.warning(f"C2KV miss: {seg.key_hash[:16]}...")
+            return False
+
+        model_runner = self.tp_worker.model_runner
+        gist_len = entry.gist_len
+        kv_start = (
+            req.kv_committed_len if logical_kv_start is None else logical_kv_start
+        )
+
+        if kv_start > req.kv_committed_len:
+            logger.warning(
+                f"C2KV: logical KV start exceeds committed KV length "
+                f"({kv_start} > {req.kv_committed_len})"
+            )
+            self._log_c2kv_token_usage(
+                "inject_invalid_logical_kv_start",
+                req=req,
+                seg_idx=seg_idx,
+                key_hash=seg.key_hash[:16],
+                gist_len=gist_len,
+                logical_kv_start=kv_start,
+            )
+            return False
+
+        trimmed_kv_len = max(req.kv_allocated_len - kv_start, 0)
+        if trimmed_kv_len > 0:
+            stale_kv_indices = model_runner.req_to_token_pool.req_to_token[
+                req.req_pool_idx, kv_start : req.kv_allocated_len
+            ]
+            model_runner.token_to_kv_pool_allocator.free(stale_kv_indices)
+            req.kv_committed_len = kv_start
+            req.kv_allocated_len = kv_start
+
+        self._log_c2kv_token_usage(
+            "inject_before_alloc",
+            req=req,
+            seg_idx=seg_idx,
+            key_hash=seg.key_hash[:16],
+            gist_len=gist_len,
+            original_seq_len=entry.original_seq_len,
+            logical_kv_start=kv_start,
+            trimmed_kv_len=trimmed_kv_len,
+        )
+
+        loc = model_runner.token_to_kv_pool_allocator.alloc(gist_len)
+        if loc is None:
+            evict_from_tree_cache(self.tree_cache, gist_len)
+            loc = model_runner.token_to_kv_pool_allocator.alloc(gist_len)
+        if loc is None:
+            logger.warning(f"C2KV: cannot allocate {gist_len} KV slots (OOM)")
+            self._log_c2kv_token_usage(
+                "inject_alloc_failed",
+                req=req,
+                seg_idx=seg_idx,
+                key_hash=seg.key_hash[:16],
+                gist_len=gist_len,
+            )
+            return False
+
+        self._log_c2kv_token_usage(
+            "inject_after_alloc",
+            req=req,
+            seg_idx=seg_idx,
+            key_hash=seg.key_hash[:16],
+            gist_len=gist_len,
+            loc_len=loc.numel(),
+        )
+
+        max_ctx = model_runner.req_to_token_pool.req_to_token.shape[1]
+        if kv_start + gist_len > max_ctx:
+            logger.warning(
+                f"C2KV: gist injection would exceed max_context_len "
+                f"({kv_start}+{gist_len}={kv_start + gist_len} > {max_ctx})"
+            )
+            model_runner.token_to_kv_pool_allocator.free(loc)
+            self._log_c2kv_token_usage(
+                "inject_context_overflow",
+                req=req,
+                seg_idx=seg_idx,
+                key_hash=seg.key_hash[:16],
+                gist_len=gist_len,
+                kv_start=kv_start,
+                max_context_len=max_ctx,
+            )
+            return False
+
+        try:
+            model_runner.req_to_token_pool.req_to_token[
+                req.req_pool_idx, kv_start : kv_start + gist_len
+            ] = loc
+        except Exception as e:
+            logger.warning(f"C2KV: req_to_token_pool write failed: {e}")
+            model_runner.token_to_kv_pool_allocator.free(loc)
+            self._log_c2kv_token_usage(
+                "inject_req_to_token_write_failed",
+                req=req,
+                seg_idx=seg_idx,
+                key_hash=seg.key_hash[:16],
+                gist_len=gist_len,
+            )
+            return False
+
+        # seg.token_start is an insertion point in the compressed prompt.
+        # Add the already-injected original-vs-gist gap to recover the absolute
+        # position in the original uncompressed prompt.
+        position_cursor = seg.token_start + req.c2kv_position_correction
+
+        try:
+            from sglang.srt.mem_cache.c2kv_injection import inject_c2kv_gist
+
+            cos_sin_cache = (
+                model_runner.model.model.layers[0].self_attn.rotary_emb.cos_sin_cache
+            )
+            attn_layers = [
+                layer.self_attn.attn for layer in model_runner.model.model.layers
+            ]
+            inject_c2kv_gist(
+                entry=entry,
+                position_cursor=position_cursor,
+                loc=loc,
+                token_to_kv_pool=model_runner.token_to_kv_pool_allocator.get_kvcache(),
+                attn_layers=attn_layers,
+                cos_sin_cache=cos_sin_cache,
+                is_neox_style=True,
+            )
+        except Exception as e:
+            logger.error(f"C2KV injection failed: {e}", exc_info=True)
+            model_runner.token_to_kv_pool_allocator.free(loc)
+            self._log_c2kv_token_usage(
+                "inject_failed",
+                req=req,
+                seg_idx=seg_idx,
+                key_hash=seg.key_hash[:16],
+                gist_len=gist_len,
+            )
+            return False
+
+        req.kv_committed_len = kv_start + gist_len
+        req.kv_allocated_len = kv_start + gist_len
+        req.c2kv_position_correction += entry.original_seq_len - gist_len
+        self._log_c2kv_token_usage(
+            "inject_success",
+            req=req,
+            seg_idx=seg_idx,
+            key_hash=seg.key_hash[:16],
+            gist_len=gist_len,
+            position_cursor=position_cursor,
+        )
+        return True
 
     def handle_batch_generate_request(
         self,

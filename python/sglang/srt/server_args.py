@@ -572,6 +572,12 @@ class ServerArgs:
     # LMCache
     enable_lmcache: bool = False
 
+    # C2KV (Concatenable and Compressible KV Cache)
+    enable_c2kv: bool = False
+    c2kv_gist_type: str = "dynamic-interleave"
+    c2kv_gist_param: str = "qkv"
+    c2kv_pool_size: int = 4096
+
     # Ktransformers/AMX expert parallelism
     kt_weight_path: Optional[str] = None
     kt_method: Optional[str] = None
@@ -5203,6 +5209,31 @@ class ServerArgs:
             "--enable-lmcache",
             action="store_true",
             help="Using LMCache as an alternative hierarchical cache solution",
+        )
+
+        # C2KV (Concatenable and Compressible KV Cache)
+        parser.add_argument(
+            "--enable-c2kv",
+            action="store_true",
+            help="Enable C2KV gist-based KV cache compression.",
+        )
+        parser.add_argument(
+            "--c2kv-gist-type",
+            type=str,
+            default=ServerArgs.c2kv_gist_type,
+            help="Gist layout type for C2KV (only 'dynamic-interleave' is implemented).",
+        )
+        parser.add_argument(
+            "--c2kv-gist-param",
+            type=str,
+            default=ServerArgs.c2kv_gist_param,
+            help="Which projections are gist-parameterised for C2KV (e.g. 'qkv').",
+        )
+        parser.add_argument(
+            "--c2kv-pool-size",
+            type=int,
+            default=ServerArgs.c2kv_pool_size,
+            help="Max gist tokens in the C2KV LRU pool across all entries.",
         )
 
         # Ktransformer server args

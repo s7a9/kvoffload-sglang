@@ -239,6 +239,64 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return None
 
+    def _compute_c2kv_segments(self, request: "ChatCompletionRequest"):
+        """
+        Detect messages annotated with c2kv_key_hash, compute their insertion
+        points in the compressed prompt after annotated messages are removed,
+        remove them from the request so _process_messages skips them, and return
+        a list of C2KVSegmentInfo descriptors. Returns None if no annotations found.
+        """
+        from sglang.srt.managers.io_struct import C2KVSegmentInfo
+
+        annotated = [
+            i
+            for i, m in enumerate(request.messages)
+            if getattr(m, "c2kv_key_hash", None)
+        ]
+        if not annotated:
+            return None
+
+        tokenizer = self.tokenizer_manager.tokenizer
+        annotated_set = set(annotated)
+
+        def chat_template_input_ids(messages):
+            if not messages:
+                return []
+            tokenized = tokenizer.apply_chat_template(
+                [m.model_dump() for m in messages],
+                tokenize=True,
+                add_generation_prompt=False,
+            )
+            if isinstance(tokenized, dict):
+                tokenized = tokenized["input_ids"]
+            return list(tokenized)
+
+        segments = []
+        for i in annotated:
+            msg = request.messages[i]
+            compressed_prefix = [
+                m
+                for j, m in enumerate(request.messages[:i])
+                if j not in annotated_set
+            ]
+            insertion_point = len(chat_template_input_ids(compressed_prefix))
+
+            segments.append(
+                C2KVSegmentInfo(
+                    key_hash=msg.c2kv_key_hash,
+                    token_start=insertion_point,
+                    token_end=insertion_point,
+                )
+            )
+
+        # Remove annotated messages so _process_messages omits their tokens from
+        # origin_input_ids; the gist injection fills each insertion point at
+        # inference time.
+        for i in reversed(annotated):
+            request.messages.pop(i)
+
+        return segments
+
     def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
@@ -259,6 +317,9 @@ class OpenAIServingChat(OpenAIServingBase):
 
         """Convert OpenAI chat completion request to internal format"""
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
+
+        # Compute C2KV segment boundaries before the chat template is applied
+        c2kv_segments = self._compute_c2kv_segments(request)
 
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
@@ -322,6 +383,7 @@ class OpenAIServingChat(OpenAIServingBase):
             image_max_dynamic_patch=img_max_dynamic_patch,
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
+            c2kv_segments=c2kv_segments,
         )
 
         return adapted_request, request

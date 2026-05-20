@@ -2722,6 +2722,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch.split_index = next_split_index
         return ret
 
+    def forward_c2kv_extract(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        compression_ratio: int,
+    ):
+        """
+        Run C2KV gist extraction for one document.
+
+        Returns:
+            gist_key_values: List[(K, V)] per layer
+            gist_mask: (1, gist_len) bool
+            gist_position_ids: (1, gist_len) int64
+        """
+        return self.model.generate_gist(
+            input_ids, attention_mask, ratio=compression_ratio
+        )
+
     def forward(
         self,
         forward_batch: ForwardBatch,

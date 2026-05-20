@@ -57,6 +57,16 @@ if _is_npu:
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
 
 
+# C2KV related imports
+from sglang.srt.mem_cache.gist_utils import (
+    GistConfig,
+    get_apply_gist_residual_func,
+    get_prepare_gist_input_func,
+)
+from torch.nn.attention.flex_attention import flex_attention
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
+
+
 class Qwen3Attention(nn.Module):
     def __init__(
         self,
@@ -133,6 +143,20 @@ class Qwen3Attention(nn.Module):
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
+
+        if get_global_server_args().enable_c2kv:
+            self.gist_qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=attention_bias,
+                quant_config=quant_config,
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
+                prefix=add_prefix("gist_qkv_proj", prefix),
+            )
+            self.flex_attention = torch.compile(flex_attention)
 
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -304,6 +328,78 @@ class Qwen3Attention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+    def forward_with_gist(
+        self,
+        hidden_states: torch.Tensor,   # (1, total_len, hidden_size)
+        gist_mask: torch.Tensor,        # (1, gist_len) bool
+        positions: torch.Tensor,        # (1, total_len) int64
+        attention_mask,                 # BlockMask or None
+        apply_gist_residual=None,
+        **kwargs,
+    ):
+
+        gist_len = gist_mask.shape[1]
+        total_len = hidden_states.shape[1]
+        seq_len = total_len - gist_len
+
+        input_hidden = hidden_states[:, :seq_len]    # (1, seq_len, hidden_size)
+        gist_hidden = hidden_states[:, seq_len:]      # (1, gist_len, hidden_size)
+
+        if apply_gist_residual is not None:
+            gist_hidden = apply_gist_residual(input_hidden, gist_hidden, **kwargs)
+
+        qkv_input, _ = self.qkv_proj(input_hidden)
+        q_input, k_input, v_input = qkv_input.split(
+            [self.q_size, self.kv_size, self.kv_size], dim=-1
+        )
+
+        qkv_gist, _ = self.gist_qkv_proj(gist_hidden)
+        q_gist, k_gist, v_gist = qkv_gist.split(
+            [self.q_size, self.kv_size, self.kv_size], dim=-1
+        )
+
+        q = torch.cat([q_input, q_gist], dim=1)   # (1, total_len, q_size)
+        k = torch.cat([k_input, k_gist], dim=1)   # (1, total_len, kv_size)
+        v = torch.cat([v_input, v_gist], dim=1)   # (1, total_len, kv_size)
+
+        q, k = apply_qk_norm(
+            q=q, k=k, q_norm=self.q_norm, k_norm=self.k_norm, head_dim=self.head_dim
+        )
+
+        # Save pre-RoPE gist K and V
+        gist_key_values = (
+            k[0, -gist_len:].contiguous().clone(),   # (gist_len, kv_size)
+            v[0, -gist_len:].contiguous().clone(),   # (gist_len, kv_size)
+        )
+
+        # Apply RoPE; squeeze batch dim so rotary_emb gets (total_len, size)
+        q = q.squeeze(0)   # (total_len, q_size)
+        k = k.squeeze(0)   # (total_len, kv_size)
+        v = v.squeeze(0)   # (total_len, kv_size)
+        q, k = self.rotary_emb(positions, q, k)
+
+        # Reshape for flex_attention: (batch, num_heads, seq_len, head_dim)
+        q = q.view(1, total_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(1, total_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(1, total_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        attn_output = self.flex_attention(
+            q, k, v, block_mask=attention_mask, scale=self.scaling, enable_gqa=True,
+        )
+
+        # Reshape back: (1, num_heads, total_len, head_dim) -> (total_len, hidden)
+        attn_output = (
+            attn_output.transpose(1, 2).contiguous().view(
+                total_len, self.num_heads * self.head_dim
+            )
+        )
+        output, _ = self.o_proj(attn_output)
+        # Manual all-reduce since o_proj has reduce_results=False
+        output = tensor_model_parallel_all_reduce(output)
+        output = output.unsqueeze(0)   # (1, total_len, hidden_size)
+
+        return output, gist_key_values
+
 
 class Qwen3DecoderLayer(nn.Module):
     def __init__(
@@ -419,6 +515,32 @@ class Qwen3DecoderLayer(nn.Module):
         )
         return hidden_states, residual
 
+    def forward_with_gist(
+        self,
+        hidden_states: torch.Tensor,
+        gist_mask: torch.Tensor,
+        positions: torch.Tensor,
+        attention_mask,
+        apply_gist_residual=None,
+        **kwargs,
+    ):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, gist_key_values = self.self_attn.forward_with_gist(
+            hidden_states,
+            gist_mask,
+            positions,
+            attention_mask,
+            apply_gist_residual=apply_gist_residual,
+            **kwargs,
+        )
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states, gist_key_values
+
 
 class Qwen3Model(Qwen2Model):
     def __init__(
@@ -435,6 +557,22 @@ class Qwen3Model(Qwen2Model):
             decoder_layer_type=Qwen3DecoderLayer,
             alt_stream=alt_stream,
         )
+
+    def _init_c2kv(self, config, server_args):
+        gist_cfg = GistConfig(
+            gist_type=server_args.c2kv_gist_type,
+            gist_param=server_args.c2kv_gist_param,
+            gist_extra_embed_num=getattr(config, "gist_extra_embed_num", 1),
+            gist_token_id=getattr(config, "gist_token_id", None),
+            gist_residual_type=getattr(config, "gist_residual_type", "none"),
+            hidden_size=config.hidden_size,
+            attention_bias=getattr(config, "attention_bias", False),
+        )
+        self.gist_embed_tokens = nn.Embedding(
+            gist_cfg.gist_extra_embed_num, config.hidden_size
+        )
+        self.prepare_gist_input = get_prepare_gist_input_func(gist_cfg)
+        self.apply_gist_residual = get_apply_gist_residual_func(gist_cfg)
 
 
 class Qwen3ForCausalLM(nn.Module):
@@ -492,6 +630,11 @@ class Qwen3ForCausalLM(nn.Module):
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
+
+        _server_args = get_global_server_args()
+        self.enable_c2kv = _server_args and _server_args.enable_c2kv
+        if self.enable_c2kv:
+            self.model._init_c2kv(config, _server_args)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()
@@ -581,6 +724,52 @@ class Qwen3ForCausalLM(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
+    @torch.no_grad()
+    def generate_gist(self, input_ids, attention_mask, ratio=4, **kwargs):
+        """
+        Run the gist extraction pass for one document.
+
+        Args:
+            input_ids:       (1, seq_len) int64 on GPU
+            attention_mask:  (1, seq_len) bool on GPU
+            ratio:           compression ratio; gist_len = ceil(seq_len / ratio)
+
+        Returns:
+            gist_key_values: List[(K, V)] per layer, each (gist_len, kv_size) float,
+                             pre-RoPE. TP-local.
+            gist_mask:       (1, gist_len) bool
+            gist_position_ids: (1, gist_len) int64
+        """
+        block_mask, gist_mask, position_ids = self.model.prepare_gist_input(
+            input_ids, attention_mask, ratio=ratio
+        )
+        gist_len = gist_mask.shape[1]
+        total_len = input_ids.shape[1] + gist_len
+        device = input_ids.device
+
+        gist_embed = self.model.gist_embed_tokens(
+            torch.zeros((1, gist_len), dtype=torch.long, device=device)
+        )
+        inputs_embeds = torch.cat(
+            [self.model.embed_tokens(input_ids), gist_embed], dim=1
+        )
+
+        hidden_states = inputs_embeds
+        gist_key_values = []
+        for layer in self.model.layers:
+            hidden_states, layer_kv = layer.forward_with_gist(
+                hidden_states,
+                gist_mask,
+                positions=position_ids.squeeze(0),
+                attention_mask=block_mask,
+                apply_gist_residual=self.model.apply_gist_residual,
+                ratio=ratio,
+            )
+            gist_key_values.append(layer_kv)
+
+        gist_position_ids = position_ids[:, -gist_len:].contiguous()
+        return gist_key_values, gist_mask, gist_position_ids
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -590,12 +779,19 @@ class Qwen3ForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
+        if self.enable_c2kv:
+            stacked_params_mapping += [
+                ("gist_qkv_proj", "gist_q_proj", "q"),
+                ("gist_qkv_proj", "gist_k_proj", "k"),
+                ("gist_qkv_proj", "gist_v_proj", "v"),
+            ]
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if not name.startswith("model.") and (
                 name.startswith("layers.")
                 or name.startswith("embed_tokens.")
+                or name.startswith("gist_embed_tokens.")
                 or name.startswith("norm.")
             ):
                 name = add_prefix(name, "model")

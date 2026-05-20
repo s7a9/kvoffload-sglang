@@ -25,6 +25,8 @@ import zmq
 from sglang.srt.managers.io_struct import (
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
+    C2KVExtractReqOutput,
+    TokenizedExtractReqInput,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
     ClearHiCacheReqInput,
@@ -238,6 +240,9 @@ class TokenizerCommunicatorMixin:
         self.dumper_control_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.c2kv_extract_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
 
@@ -309,6 +314,10 @@ class TokenizerCommunicatorMixin:
                     self.flush_cache_communicator.handle_recv,
                 ),
                 (
+                    C2KVExtractReqOutput,
+                    self.c2kv_extract_communicator.handle_recv,
+                ),
+                (
                     ProfileReqOutput,
                     self.profile_communicator.handle_recv,
                 ),
@@ -350,6 +359,25 @@ class TokenizerCommunicatorMixin:
         return (
             await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
         )[0]
+
+    async def c2kv_extract(
+        self: TokenizerManager,
+        input_ids: list,
+        input_text: str,
+        compression_ratio: int = 4,
+        rid: Optional[str] = None,
+    ) -> C2KVExtractReqOutput:
+        """Run C2KV gist extraction via the scheduler."""
+        import uuid
+
+        self.auto_create_handle_loop()
+        req = TokenizedExtractReqInput(
+            rid=rid or uuid.uuid4().hex,
+            input_ids=input_ids,
+            input_text=input_text,
+            compression_ratio=compression_ratio,
+        )
+        return (await self.c2kv_extract_communicator(req))[0]
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""
