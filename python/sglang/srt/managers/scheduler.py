@@ -243,6 +243,7 @@ logger = logging.getLogger(__name__)
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
+ENABLE_C2KV_LOGGING = get_bool_env_var("SGLANG_ENABLE_C2KV_LOGGING")
 
 _is_npu = is_npu()
 
@@ -1945,6 +1946,8 @@ class Scheduler(
             self._add_request_to_queue(req)
 
     def _log_c2kv_token_usage(self, event: str, req: Optional["Req"] = None, **kwargs):
+        if not ENABLE_C2KV_LOGGING:
+            return
         try:
             log_fields = {
                 "event": event,

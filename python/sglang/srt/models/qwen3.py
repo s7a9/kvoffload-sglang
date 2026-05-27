@@ -334,7 +334,7 @@ class Qwen3Attention(nn.Module):
         gist_mask: torch.Tensor,        # (1, gist_len) bool
         positions: torch.Tensor,        # (1, total_len) int64
         attention_mask,                 # BlockMask or None
-        apply_gist_residual=None,
+        apply_gist_residual,
         **kwargs,
     ):
 
@@ -345,8 +345,7 @@ class Qwen3Attention(nn.Module):
         input_hidden = hidden_states[:, :seq_len]    # (1, seq_len, hidden_size)
         gist_hidden = hidden_states[:, seq_len:]      # (1, gist_len, hidden_size)
 
-        if apply_gist_residual is not None:
-            gist_hidden = apply_gist_residual(input_hidden, gist_hidden, **kwargs)
+        gist_hidden = apply_gist_residual(input_hidden, gist_hidden, **kwargs)
 
         qkv_input, _ = self.qkv_proj(input_hidden)
         q_input, k_input, v_input = qkv_input.split(
@@ -521,7 +520,7 @@ class Qwen3DecoderLayer(nn.Module):
         gist_mask: torch.Tensor,
         positions: torch.Tensor,
         attention_mask,
-        apply_gist_residual=None,
+        apply_gist_residual,
         **kwargs,
     ):
         residual = hidden_states
@@ -558,7 +557,7 @@ class Qwen3Model(Qwen2Model):
             alt_stream=alt_stream,
         )
 
-    def _init_c2kv(self, config, server_args):
+    def _init_c2kv(self, config, server_args) -> GistConfig:
         gist_cfg = GistConfig(
             gist_type=server_args.c2kv_gist_type,
             gist_param=server_args.c2kv_gist_param,
@@ -572,7 +571,7 @@ class Qwen3Model(Qwen2Model):
             gist_cfg.gist_extra_embed_num, config.hidden_size
         )
         self.prepare_gist_input = get_prepare_gist_input_func(gist_cfg)
-        self.apply_gist_residual = get_apply_gist_residual_func(gist_cfg)
+        return gist_cfg
 
 
 class Qwen3ForCausalLM(nn.Module):
@@ -634,7 +633,7 @@ class Qwen3ForCausalLM(nn.Module):
         _server_args = get_global_server_args()
         self.enable_c2kv = _server_args and _server_args.enable_c2kv
         if self.enable_c2kv:
-            self.model._init_c2kv(config, _server_args)
+            self.gist_cfg = self.model._init_c2kv(config, _server_args)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()
@@ -744,7 +743,6 @@ class Qwen3ForCausalLM(nn.Module):
             input_ids, attention_mask, ratio=ratio
         )
         gist_len = gist_mask.shape[1]
-        total_len = input_ids.shape[1] + gist_len
         device = input_ids.device
 
         gist_embed = self.model.gist_embed_tokens(
@@ -756,13 +754,14 @@ class Qwen3ForCausalLM(nn.Module):
 
         hidden_states = inputs_embeds
         gist_key_values = []
-        for layer in self.model.layers:
+        for layer_idx, layer in enumerate(self.model.layers):
+            layer_residual = get_apply_gist_residual_func(self.gist_cfg, layer_idx)
             hidden_states, layer_kv = layer.forward_with_gist(
                 hidden_states,
                 gist_mask,
                 positions=position_ids.squeeze(0),
                 attention_mask=block_mask,
-                apply_gist_residual=self.model.apply_gist_residual,
+                apply_gist_residual=layer_residual,
                 ratio=ratio,
             )
             gist_key_values.append(layer_kv)

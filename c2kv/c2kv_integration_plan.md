@@ -250,7 +250,7 @@ if server_args.enable_c2kv:
 
 ### 4c — `Qwen3Attention.forward_with_gist`
 
-Signature: `(self, hidden_states, gist_len, positions, attention_mask, apply_gist_residual=None, **kwargs)`
+Signature: `(self, hidden_states, gist_len, positions, attention_mask, apply_gist_residual, **kwargs)`
 
 **[Changed]** `attention_mask` here is already a `BlockMask` (pre-built by `gist_utils`). The
 method does **not** call `create_block_mask` itself.
@@ -277,7 +277,7 @@ Wraps attention with pre/post layernorm and MLP:
 
 ```python
 def forward_with_gist(self, hidden_states, gist_len, positions, attention_mask,
-                      apply_gist_residual=None, **kwargs):
+                      apply_gist_residual, **kwargs):
     residual = hidden_states
     hidden_states = self.input_layernorm(hidden_states)
     hidden_states, gist_key_values = self.self_attn.forward_with_gist(

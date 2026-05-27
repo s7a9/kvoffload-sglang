@@ -967,11 +967,17 @@ class Req(ReqDllmMixin):
             and 0 < self.c2kv_round_idx < len(self.c2kv_rounds)
         ):
             self.c2kv_requeued = False
-            prefix_len = len(self.prefix_indices)
+            self.host_hit_length = 0
+            # Use kv_committed_len as the authoritative prefix length.
+            # len(prefix_indices) should agree, but _compute_prefix_matches
+            # may have overwritten prefix_indices in cache-aware policies.
+            prefix_len = self.kv_committed_len
+            virtual_prefix = self.c2kv_full_origin_input_ids
+            if virtual_prefix is None or prefix_len > len(virtual_prefix):
+                prefix_len = 0
             self.fill_ids = (
-                list(self.c2kv_full_origin_input_ids[:prefix_len])
-                + list(self.origin_input_ids)
-            )
+                list(virtual_prefix[:prefix_len]) if prefix_len > 0 else []
+            ) + list(self.origin_input_ids)
             self.set_extend_input_len(len(self.origin_input_ids))
             return
 
@@ -1659,7 +1665,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
-            assert seq_len - pre_len == req.extend_input_len
+            assert seq_len - pre_len == req.extend_input_len, (
+                f"seq_len({seq_len}) - pre_len({pre_len}) = {seq_len - pre_len} "
+                f"!= extend_input_len({req.extend_input_len}), "
+                f"c2kv_round={getattr(req, 'c2kv_round_idx', None)}, "
+                f"kv_committed={req.kv_committed_len}"
+            )
 
             req.extend_batch_idx += 1
 

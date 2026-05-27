@@ -12,6 +12,8 @@ from typing import Callable, Optional
 import torch
 from torch.nn.attention.flex_attention import create_block_mask
 
+create_block_mask_compiled = torch.compile(create_block_mask)
+
 
 @dataclass
 class GistConfig:
@@ -48,7 +50,7 @@ def get_prepare_gist_input_func(gist_cfg: GistConfig) -> Callable:
         # Mask logic (True = attend):
         #   input-to-input: causal (q_idx >= kv_idx)
         #   input-to-gist: never (input tokens cannot see gist tokens)
-        #   gist-to-input: full attention
+        #   gist-to-input: its chunk & sink tokens
         #   gist-to-gist: causal (q_idx >= kv_idx)
         def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
             is_q_input = q_idx < seq_len
@@ -57,14 +59,19 @@ def get_prepare_gist_input_func(gist_cfg: GistConfig) -> Callable:
             # input query attending input key: causal
             input_to_input = is_q_input & is_kv_input & (q_idx >= kv_idx)
             # input query attending gist key: never
-            # gist query attending input key: always
-            gist_to_input = (~is_q_input) & is_kv_input
+            # gist query attending input key: its chunk & sink tokens
+            gist_j = q_idx - seq_len
+            chunk_begin = gist_j * ratio
+            chunk_end = (gist_j + 1) * ratio
+            gist_to_input = (~is_q_input) & is_kv_input & (
+                ((kv_idx >= chunk_begin) & (kv_idx < chunk_end)) | (kv_idx < ratio)
+            )
             # gist query attending gist key: causal
             gist_to_gist = (~is_q_input) & (~is_kv_input) & (q_idx >= kv_idx)
 
             return input_to_input | gist_to_input | gist_to_gist
 
-        block_mask = create_block_mask(
+        block_mask = create_block_mask_compiled(
             mask_mod, B=1, H=None, Q_LEN=total_len, KV_LEN=total_len, device=device
         )
 
@@ -85,15 +92,43 @@ def get_prepare_gist_input_func(gist_cfg: GistConfig) -> Callable:
     return prepare_gist_input
 
 
-def get_apply_gist_residual_func(gist_cfg: GistConfig) -> Callable:
+def _apply_gist_residual_interleave(
+    tokens_tensor: torch.Tensor, gist_tensor: torch.Tensor, **kwargs
+) -> torch.Tensor:
+    ratio = kwargs["ratio"]
+    batch_size, seq_length, hidden_size = tokens_tensor.shape
+    pad_length = seq_length % ratio
+    nopad_length = seq_length - pad_length
+    mean_tensor = tokens_tensor[:, :nopad_length].reshape(
+        batch_size, -1, ratio, hidden_size
+    ).mean(dim=2)
+    if pad_length != 0:
+        pad_mean = tokens_tensor[:, nopad_length:].mean(dim=1, keepdim=True)
+        mean_tensor = torch.cat([mean_tensor, pad_mean], dim=1)
+    return mean_tensor + gist_tensor
+
+
+def _apply_none(input_hidden, gist_hidden, **kwargs):
+    return gist_hidden
+
+
+def get_apply_gist_residual_func(gist_cfg: GistConfig, layer_idx: int) -> Callable:
     """
     Returns apply_gist_residual(input_hidden, gist_hidden, **kwargs) -> gist_hidden.
 
-    For gist_residual_type == "none" this is an identity on gist_hidden.
+    Residual types:
+        "none"       -> identity on gist_hidden
+        "mean"       -> chunk-mean of input + gist_hidden at every layer
+        "embed-mean" -> chunk-mean of input + gist_hidden at layer 0 only
     """
+    residual_type = gist_cfg.gist_residual_type
 
-    def apply_gist_residual(input_hidden, gist_hidden, **kwargs):
-        # Identity: no residual connection by default.
-        return gist_hidden
+    if residual_type == "embed-mean":
+        if layer_idx != 0: # only apply at layer 0
+            return _apply_none
+        return _apply_gist_residual_interleave
 
-    return apply_gist_residual
+    if residual_type == "mean":
+        return _apply_gist_residual_interleave
+
+    return _apply_none

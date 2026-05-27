@@ -193,6 +193,14 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
+            # C2KV multi-round requests in active rounds have prefix_indices
+            # set by the output processor to reference injected gist KV slots.
+            # Overwriting them with a tree-cache match would lose the gist
+            # state and cause length mismatches in prepare_for_extend.
+            c2kv_rounds = getattr(r, "c2kv_rounds", None)
+            if c2kv_rounds is not None and 0 < getattr(r, "c2kv_round_idx", 0) < len(c2kv_rounds):
+                continue
+
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             # NOTE: the prefix_indices must always be aligned with last_node
