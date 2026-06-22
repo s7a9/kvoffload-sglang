@@ -554,6 +554,7 @@ class LlamaModel(nn.Module):
             gist_extra_embed_num=getattr(config, "gist_extra_embed_num", 1),
             gist_token_id=getattr(config, "gist_token_id", None),
             gist_residual_type=getattr(config, "gist_residual_type", "none"),
+            gist_overlap=getattr(config, "gist_overlap", 0),
             hidden_size=config.hidden_size,
             attention_bias=getattr(config, "attention_bias", False),
         )

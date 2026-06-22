@@ -22,6 +22,7 @@ class GistConfig:
     gist_extra_embed_num: int = 1
     gist_token_id: Optional[int] = None
     gist_residual_type: str = "none"
+    gist_overlap: int = 0
     hidden_size: int = 4096
     attention_bias: bool = False
 
@@ -35,10 +36,15 @@ def get_prepare_gist_input_func(gist_cfg: GistConfig) -> Callable:
         input tokens see each other causally; cannot see gist tokens.
         gist tokens attend all input tokens; see each other causally.
 
+    Each gist token attends to its own chunk plus `gist_overlap` preceding
+    tokens (clamped to 0), i.e. [max(j*ratio - gist_overlap, 0), (j+1)*ratio).
+
     Position IDs:
         input token i  -> position i
         gist token j   -> min((j+1)*ratio - 1, seq_len - 1)
     """
+
+    gist_overlap = gist_cfg.gist_overlap
 
     def prepare_gist_input(input_ids, attention_mask, ratio=4):
         device = input_ids.device
@@ -61,7 +67,9 @@ def get_prepare_gist_input_func(gist_cfg: GistConfig) -> Callable:
             # input query attending gist key: never
             # gist query attending input key: its chunk & sink tokens
             gist_j = q_idx - seq_len
-            chunk_begin = gist_j * ratio
+            # extend the chunk backward by gist_overlap tokens; kv_idx >= 0
+            # naturally clamps the lower bound to 0.
+            chunk_begin = gist_j * ratio - gist_overlap
             chunk_end = (gist_j + 1) * ratio
             gist_to_input = (~is_q_input) & is_kv_input & (
                 ((kv_idx >= chunk_begin) & (kv_idx < chunk_end)) | (kv_idx < ratio)
