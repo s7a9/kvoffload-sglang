@@ -12,8 +12,6 @@ from typing import Callable, Optional
 import torch
 from torch.nn.attention.flex_attention import create_block_mask
 
-create_block_mask_compiled = torch.compile(create_block_mask)
-
 
 @dataclass
 class GistConfig:
@@ -79,7 +77,7 @@ def get_prepare_gist_input_func(gist_cfg: GistConfig) -> Callable:
 
             return input_to_input | gist_to_input | gist_to_gist
 
-        block_mask = create_block_mask_compiled(
+        block_mask = create_block_mask(
             mask_mod, B=1, H=None, Q_LEN=total_len, KV_LEN=total_len, device=device
         )
 

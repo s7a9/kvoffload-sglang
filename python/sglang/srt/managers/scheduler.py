@@ -2257,10 +2257,13 @@ class Scheduler(
             )
             return False
 
-        # seg.token_start is an insertion point in the compressed prompt.
-        # Add the already-injected original-vs-gist gap to recover the absolute
-        # position in the original uncompressed prompt.
-        position_cursor = seg.token_start + req.c2kv_position_correction
+        # kv_start is where this gist block lands in the (gist-inclusive) KV
+        # sequence; it already accounts for the gist KV of preceding segments.
+        # Adding the accumulated original-vs-gist gap recovers the absolute
+        # position in the original uncompressed prompt. (seg.token_start cannot
+        # be used here: _compute_c2kv_segments measures it with ALL gist messages
+        # removed, so for consecutive documents it omits prior gist lengths.)
+        position_cursor = kv_start + req.c2kv_position_correction
 
         try:
             from sglang.srt.mem_cache.c2kv_injection import inject_c2kv_gist
