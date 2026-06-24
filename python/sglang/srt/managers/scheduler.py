@@ -2034,10 +2034,25 @@ class Scheduler(
                 original_seq_len=existing.original_seq_len,
             )
 
+        # In overlap mode run_batch dispatches GPU work (including NCCL all-reduces)
+        # onto forward_stream, while forward_c2kv_extract runs on schedule_stream.
+        # forward_stream already calls forward_stream.wait_stream(schedule_stream)
+        # before each batch, but the reverse dependency is absent.  If a decode
+        # CUDA graph (with its captured NCCL ops) is still executing on forward_stream
+        # when we start the extract's NCCL ops on schedule_stream, the two sets of
+        # NCCL calls run concurrently on different streams.  Because NCCL matches
+        # peer communications by submission order, the ordering seen by each TP rank
+        # can diverge → deadlock.  Serialise by making schedule_stream wait for any
+        # in-flight forward_stream work before issuing extract NCCL operations.
+        if self.enable_overlap and self.forward_stream is not None:
+            self.schedule_stream.wait_stream(self.forward_stream)
+
         input_ids = torch.tensor(
             [recv_req.input_ids], dtype=torch.long, device="cuda"
         )
         attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        error_msg = None
+        gist_key_values = gist_mask = gist_position_ids = None
         try:
             gist_key_values, gist_mask, gist_position_ids = (
                 self.tp_worker.model_runner.forward_c2kv_extract(
@@ -2045,13 +2060,28 @@ class Scheduler(
                 )
             )
         except Exception as e:
-            logger.error(f"C2KV extract failed: {e}")
-            # print the stack trace
-            import traceback
-            traceback.print_exc()
-            import sys
-            print(sys.exc_info())
-            return C2KVExtractReqOutput(error=str(e), success=False)
+            logger.error(f"C2KV extract failed: {e}", exc_info=True)
+            error_msg = str(e)
+
+        # TP pool-state guard: if forward_c2kv_extract raises on one rank but
+        # not another, that rank skips c2kv_pool.store().  On the next extract
+        # for the same key the storing ranks get a cache-hit (no NCCL) while the
+        # non-storing rank gets a cache-miss and enters forward_c2kv_extract
+        # (NCCL all-reduces) — another deadlock path.  All-reduce the success
+        # flag across the Gloo CPU group (independent of the NCCL GPU communicator)
+        # so every rank either stores or discards together.
+        if self.tp_size > 1 and torch.distributed.is_initialized():
+            local_ok = torch.tensor([0 if error_msg else 1], dtype=torch.long)
+            torch.distributed.all_reduce(
+                local_ok,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_cpu_group,
+            )
+            if local_ok.item() == 0 and error_msg is None:
+                error_msg = "C2KV extract failed on a peer TP rank"
+
+        if error_msg is not None:
+            return C2KVExtractReqOutput(error=error_msg, success=False)
 
         original_seq_len = len(recv_req.input_ids)
         entry = self.c2kv_pool.store(
