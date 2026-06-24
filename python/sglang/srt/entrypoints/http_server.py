@@ -1405,6 +1405,7 @@ async def v1_c2kv_extract(
     try:
         tokenizer_manager = _global_state.tokenizer_manager
         tokenizer = tokenizer_manager.tokenizer
+        chat_template_kwargs = request.chat_template_kwargs or {}
 
         if request.role:
             # Compute the exact tokens this message contributes when placed in a
@@ -1414,12 +1415,28 @@ async def v1_c2kv_extract(
             dummy = [{"role": dummy_role, "content": "x"}]
             target = [{"role": request.role, "content": request.text}]
             prev_ids = tokenizer.apply_chat_template(
-                dummy, tokenize=True, add_generation_prompt=False
-            )['input_ids']
+                dummy,
+                tokenize=True,
+                add_generation_prompt=False,
+                **chat_template_kwargs,
+            )["input_ids"]
             full_ids = tokenizer.apply_chat_template(
-                dummy + target, tokenize=True, add_generation_prompt=False
-            )['input_ids']
+                dummy + target,
+                tokenize=True,
+                add_generation_prompt=False,
+                **chat_template_kwargs,
+            )["input_ids"]
             input_ids = list(full_ids[len(prev_ids):])
+            if not input_ids:
+                return C2KVExtractResponse(
+                    key_hash="",
+                    gist_len=0,
+                    original_seq_len=0,
+                    success=False,
+                    error="The message contributes no tokens after applying "
+                          "the chat template. Please check if the chat template "
+                          "is correct and compatible with the input messages.",
+                )
         else:
             input_ids = tokenizer.encode(request.text)
             if not isinstance(input_ids, list):

@@ -11,6 +11,11 @@ from typing import Callable, Optional
 
 import torch
 from torch.nn.attention.flex_attention import create_block_mask
+from torch.nn.attention.flex_attention import FlexKernelOptions
+
+C2KV_KERNEL_OPTIONS = FlexKernelOptions(
+    FORCE_USE_FLEX_ATTENTION=True,
+)
 
 
 @dataclass

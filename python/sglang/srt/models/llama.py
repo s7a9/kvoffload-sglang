@@ -60,6 +60,7 @@ from sglang.srt.mem_cache.gist_utils import (
     GistConfig,
     get_apply_gist_residual_func,
     get_prepare_gist_input_func,
+    C2KV_KERNEL_OPTIONS,
 )
 from torch.nn.attention.flex_attention import flex_attention
 
@@ -213,7 +214,7 @@ class LlamaAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("gist_qkv_proj", prefix),
             )
-            self.flex_attention = torch.compile(flex_attention)
+            self.flex_attention = torch.compile(flex_attention, dynamic=True)
 
     def forward_prepare_native(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -312,6 +313,7 @@ class LlamaAttention(nn.Module):
 
         attn_output = self.flex_attention(
             q, k, v, block_mask=attention_mask, scale=self.scaling, enable_gqa=True,
+            kernel_options=C2KV_KERNEL_OPTIONS,
         )
 
         # Reshape back: (1, num_heads, total_len, head_dim) -> (total_len, hidden)

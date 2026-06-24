@@ -1511,6 +1511,7 @@ class C2KVExtractRequest(BaseModel):
     text: str
     compression_ratio: int = Field(default=4)
     role: Optional[str] = None
+    chat_template_kwargs: Optional[Dict] = None
 
 
 class C2KVExtractResponse(BaseModel):

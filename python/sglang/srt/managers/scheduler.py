@@ -1929,7 +1929,16 @@ class Scheduler(
                 full_prompt_len=len(req.origin_input_ids),
                 num_segments=len(req.c2kv_segments),
             )
-            self._build_c2kv_prefill_rounds(req)
+            c2kv_error = self._build_c2kv_prefill_rounds(req)
+            if c2kv_error is not None:
+                req.set_finish_with_abort(c2kv_error)
+                self._log_c2kv_token_usage(
+                    "generate_build_rounds_failed",
+                    req=req,
+                    error=c2kv_error,
+                )
+                self._add_request_to_queue(req)
+                return
             self._log_c2kv_token_usage(
                 "generate_after_build_rounds",
                 req=req,
@@ -2064,9 +2073,9 @@ class Scheduler(
             original_seq_len=original_seq_len,
         )
 
-    def _build_c2kv_prefill_rounds(self, req: "Req") -> None:
+    def _build_c2kv_prefill_rounds(self, req: "Req") -> Optional[str]:
         if not req.c2kv_segments:
-            return
+            return None
 
         from sglang.srt.managers.schedule_batch import C2KVPrefillRound
         from sglang.srt.mem_cache.c2kv_pool import c2kv_gist_token_ids
@@ -2075,6 +2084,17 @@ class Scheduler(
         original_len = len(original_input_ids)
         segments = sorted(req.c2kv_segments, key=lambda s: s.token_start)
         req.c2kv_segments = segments
+
+        if self.c2kv_pool is None:
+            return "C2KV not enabled."
+
+        entries = []
+        for seg in segments:
+            entry = self.c2kv_pool.get(seg.key_hash)
+            if entry is None:
+                logger.warning("C2KV cache miss: %s", seg.key_hash)
+                return f"C2KV cache miss: {seg.key_hash}"
+            entries.append(entry)
 
         prev_end = 0
         for seg in segments:
@@ -2095,7 +2115,7 @@ class Scheduler(
         pending_seg_indices: list = []
         cursor = 0
 
-        for seg_idx, seg in enumerate(segments):
+        for seg_idx, (seg, entry) in enumerate(zip(segments, entries)):
             normal_tokens = original_input_ids[cursor : seg.token_start]
             if normal_tokens:
                 rounds.append(
@@ -2104,9 +2124,7 @@ class Scheduler(
                 pending_seg_indices = []
                 virtual_ids.extend(normal_tokens)
 
-            entry = self.c2kv_pool.get(seg.key_hash) if self.c2kv_pool else None
-            if entry is not None:
-                virtual_ids.extend(c2kv_gist_token_ids(seg.key_hash, entry.gist_len))
+            virtual_ids.extend(c2kv_gist_token_ids(seg.key_hash, entry.gist_len))
 
             if rounds:
                 rounds[-1].post_inject_seg_indices.append(seg_idx)
@@ -2144,6 +2162,8 @@ class Scheduler(
         if rounds and rounds[0].tokens:
             req.origin_input_ids = rounds[0].tokens
             req.fill_ids = list(rounds[0].tokens)
+
+        return None
 
     def _inject_c2kv_gist_segment(
         self, req: "Req", seg_idx: int, logical_kv_start: Optional[int] = None
