@@ -15,7 +15,7 @@ DTYPE="${DTYPE:-auto}"
 cd "${REPO_ROOT}"
 
 CMD=(
-	python -m sglang.launch_server
+	sglang serve
 	--model-path "${MODEL_PATH}"
 	--host "${HOST}"
 	--port "${PORT}"
@@ -26,6 +26,7 @@ CMD=(
     --tool-call-parser minimax-m2
     --reasoning-parser minimax-append-think
 	--max-running-requests 128
+	--mem-fraction-static 0.6
 )
 
 if [[ -n "${TAG}" ]]; then

@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 TAG="${TAG:-}"
-MODEL_PATH="${MODEL_PATH:-MiniMaxAI/MiniMax-M2.77}"
+MODEL_PATH="${MODEL_PATH:-MiniMaxAI/MiniMax-M2.7}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-30000}"
 TP_SIZE="${TP_SIZE:-8}"
@@ -19,7 +19,7 @@ KV_OFFLOAD_POLICY="${KV_OFFLOAD_POLICY:-paper_v1}"
 cd "${REPO_ROOT}"
 
 CMD=(
-	python -m sglang.launch_server
+	sglang serve
 	--model-path "${MODEL_PATH}"
 	--host "${HOST}"
 	--port "${PORT}"
@@ -31,8 +31,9 @@ CMD=(
 	--trust-remote-code
     --tool-call-parser minimax-m2
     --reasoning-parser minimax-append-think
-	--hicache-size 20
+	--hicache-size 40
 	--max-running-requests 128
+	--mem-fraction-static 0.6
 )
 
 if [[ -n "${TAG}" ]]; then
