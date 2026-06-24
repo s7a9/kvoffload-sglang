@@ -267,7 +267,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 tokenize=True,
                 add_generation_prompt=False,
             )
-            if isinstance(tokenized, dict):
+            if hasattr(tokenized, "input_ids"):
+                tokenized = tokenized.input_ids
+            elif isinstance(tokenized, dict):
                 tokenized = tokenized["input_ids"]
             return list(tokenized)
 

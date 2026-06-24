@@ -1408,25 +1408,22 @@ async def v1_c2kv_extract(
         chat_template_kwargs = request.chat_template_kwargs or {}
 
         if request.role:
-            # Compute the exact tokens this message contributes when placed in a
-            # non-first position, matching _compute_c2kv_segments which uses
-            # full_ids[len(prev_ids):] for message i > 0.
-            dummy_role = "system" if request.role != "system" else "user"
-            dummy = [{"role": dummy_role, "content": "x"}]
-            target = [{"role": request.role, "content": request.text}]
-            prev_ids = tokenizer.apply_chat_template(
-                dummy,
-                tokenize=True,
+            # Tokenize the same way the HF training code does
+            # (tokenize_for_reuse): apply chat template to get a string,
+            # then tokenize the string.  The two-step approach avoids BPE
+            # boundary differences that arise when subtracting token-ID
+            # prefixes from a jointly-tokenized multi-message sequence.
+            text_str = tokenizer.apply_chat_template(
+                [{"role": request.role, "content": request.text}],
+                tokenize=False,
                 add_generation_prompt=False,
                 **chat_template_kwargs,
-            )["input_ids"]
-            full_ids = tokenizer.apply_chat_template(
-                dummy + target,
-                tokenize=True,
-                add_generation_prompt=False,
-                **chat_template_kwargs,
-            )["input_ids"]
-            input_ids = list(full_ids[len(prev_ids):])
+            )
+            if tokenizer.bos_token and text_str.startswith(tokenizer.bos_token):
+                text_str = text_str[len(tokenizer.bos_token):]
+            input_ids = tokenizer.encode(text_str, add_special_tokens=False)
+            if not isinstance(input_ids, list):
+                input_ids = list(input_ids)
             if not input_ids:
                 return C2KVExtractResponse(
                     key_hash="",
