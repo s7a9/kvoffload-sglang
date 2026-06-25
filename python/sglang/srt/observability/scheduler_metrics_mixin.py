@@ -399,6 +399,8 @@ class SchedulerMetricsMixin:
             msg += f"#prealloc-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             msg += f"#inflight-req: {len(self.disagg_prefill_inflight_queue)}, "
 
+        msg += self._get_c2kv_pool_log_msg()
+
         if (
             self.server_args.language_only
             and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
@@ -494,6 +496,7 @@ class SchedulerMetricsMixin:
             self.calculate_utilization()
             self.update_lora_metrics()
             self._log_hicache_stats()
+            self._log_c2kv_pool_stats()
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
@@ -638,6 +641,8 @@ class SchedulerMetricsMixin:
             msg += f"#transfer-req: {len(self.disagg_decode_transfer_queue.queue)}, "
             msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
 
+        msg += self._get_c2kv_pool_log_msg()
+
         if (
             self.server_args.language_only
             and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
@@ -739,6 +744,7 @@ class SchedulerMetricsMixin:
             self.calculate_utilization()
             self.update_lora_metrics()
             self._log_hicache_stats()
+            self._log_c2kv_pool_stats()
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
@@ -803,6 +809,35 @@ class SchedulerMetricsMixin:
             host_pool.size - host_pool.available_size()
         )
         self.stats.hicache_host_total_tokens = host_pool.size
+
+    def _log_c2kv_pool_stats(self: Scheduler):
+        """Populate C2KV pool occupancy stats for Prometheus gauges."""
+        c2kv_pool = getattr(self, "c2kv_pool", None)
+        if c2kv_pool is None:
+            return
+
+        used_tokens = c2kv_pool.current_tokens()
+        total_tokens = c2kv_pool.max_total_tokens
+        self.stats.c2kv_pool_used_tokens = used_tokens
+        self.stats.c2kv_pool_total_tokens = total_tokens
+        self.stats.c2kv_pool_utilization = (
+            used_tokens / total_tokens if total_tokens > 0 else 0.0
+        )
+        self.stats.c2kv_pool_num_entries = c2kv_pool.num_entries()
+
+    def _get_c2kv_pool_log_msg(self: Scheduler) -> str:
+        c2kv_pool = getattr(self, "c2kv_pool", None)
+        if c2kv_pool is None:
+            return ""
+
+        used_tokens = c2kv_pool.current_tokens()
+        total_tokens = c2kv_pool.max_total_tokens
+        utilization = used_tokens / total_tokens if total_tokens > 0 else 0.0
+        return (
+            f"c2kv pool: {used_tokens}/{total_tokens} tokens, "
+            f"c2kv usage: {utilization:.2f}, "
+            f"#c2kv-entry: {c2kv_pool.num_entries()}, "
+        )
 
     def update_lora_metrics(self: Scheduler):
         """Update LoRA pool metrics for monitoring and autoscaling."""

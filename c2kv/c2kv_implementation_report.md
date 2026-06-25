@@ -83,7 +83,10 @@ Client
 ### 5.1 C2KV Pool (`c2kv_pool.py`)
 
 An in-memory, GPU-resident LRU cache bounded by `max_total_tokens` (sum of `gist_len` across all
-entries). Uses `collections.OrderedDict` for O(1) LRU promotion.
+entries). K/V and position storage are preallocated at startup. The implementation reuses
+SGLang's `MHATokenToKVPool` and `TokenToKVPoolAllocator`; each entry only stores its allocated
+token indices and lightweight metadata. LRU eviction releases those indices back to the
+allocator, avoiding long-lived per-entry CUDA tensor allocations.
 
 **Key design choice — hash over token IDs, not text:**
 
@@ -129,7 +132,7 @@ The `block_mask` encodes a 2×2 block attention pattern:
 
 ### 5.3 Gist injection (`c2kv_injection.py`)
 
-`inject_c2kv_gist(entry, position_cursor, loc, token_to_kv_pool, attn_layers, cos_sin_cache)`
+`inject_c2kv_gist(entry, c2kv_pool, position_cursor, loc, token_to_kv_pool, attn_layers, cos_sin_cache)`
 
 For each layer:
 1. Compute `abs_pos[j] = position_cursor + gist_position_ids[0, j]` (clamped to cos_sin_cache size).

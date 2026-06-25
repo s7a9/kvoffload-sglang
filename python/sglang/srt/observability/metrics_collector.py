@@ -130,6 +130,12 @@ class SchedulerStats:
     hicache_host_used_tokens: int = 0
     hicache_host_total_tokens: int = 0
 
+    # C2KV pool metrics
+    c2kv_pool_used_tokens: int = 0
+    c2kv_pool_total_tokens: int = 0
+    c2kv_pool_utilization: float = 0.0
+    c2kv_pool_num_entries: int = 0
+
     # Routing key metrics
     num_unique_running_routing_keys: int = 0
     routing_key_running_req_counts: List[int] = field(default_factory=list)
@@ -182,6 +188,7 @@ class SchedulerMetricsCollector:
         self.labels = labels
         self.enable_lora = enable_lora
         self.enable_hierarchical_cache = enable_hierarchical_cache
+        self.enable_c2kv = bool(getattr(server_args, "enable_c2kv", False))
         self.last_log_time = time.perf_counter()
         self._known_priorities: Set[int] = set()
 
@@ -652,6 +659,32 @@ class SchedulerMetricsCollector:
                 multiprocess_mode="mostrecent",
             )
 
+        if self.enable_c2kv:
+            self.c2kv_pool_used_tokens = Gauge(
+                name="sglang:c2kv_pool_used_tokens",
+                documentation="The number of used token slots in the C2KV pool.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.c2kv_pool_total_tokens = Gauge(
+                name="sglang:c2kv_pool_total_tokens",
+                documentation="The total number of token slots in the C2KV pool.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.c2kv_pool_utilization = Gauge(
+                name="sglang:c2kv_pool_utilization",
+                documentation="The token slot utilization of the C2KV pool.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.c2kv_pool_num_entries = Gauge(
+                name="sglang:c2kv_pool_num_entries",
+                documentation="The number of entries stored in the C2KV pool.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+
         self.num_unique_running_routing_keys = Gauge(
             name="sglang:num_unique_running_routing_keys",
             documentation="Number of unique routing keys in running batch.",
@@ -1045,6 +1078,20 @@ class SchedulerMetricsCollector:
             )
             self._log_gauge(
                 self.hicache_host_total_tokens, stats.hicache_host_total_tokens
+            )
+
+        if self.enable_c2kv:
+            self._log_gauge(
+                self.c2kv_pool_used_tokens, stats.c2kv_pool_used_tokens
+            )
+            self._log_gauge(
+                self.c2kv_pool_total_tokens, stats.c2kv_pool_total_tokens
+            )
+            self._log_gauge(
+                self.c2kv_pool_utilization, stats.c2kv_pool_utilization
+            )
+            self._log_gauge(
+                self.c2kv_pool_num_entries, stats.c2kv_pool_num_entries
             )
 
         self._log_gauge(

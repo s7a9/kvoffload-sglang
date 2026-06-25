@@ -853,6 +853,16 @@ class Scheduler(
             self.c2kv_pool = C2KVPool(
                 max_total_tokens=max_total_tokens,
                 max_entry_tokens=server_args.c2kv_max_tokens,
+                dtype=model_runner.dtype,
+                num_kv_heads=self.model_config.get_num_kv_heads(
+                    self.attn_tp_group.world_size
+                ),
+                head_dim=self.model_config.head_dim,
+                value_head_dim=self.model_config.v_head_dim,
+                num_layers=model_runner.num_effective_layers,
+                device=model_runner.device,
+                start_layer=model_runner.start_layer,
+                enable_memory_saver=server_args.enable_memory_saver,
             )
             logger.info(
                 "C2KV pool initialised "
@@ -2399,6 +2409,7 @@ class Scheduler(
             ]
             inject_c2kv_gist(
                 entry=entry,
+                c2kv_pool=self.c2kv_pool,
                 position_cursor=position_cursor,
                 loc=loc,
                 token_to_kv_pool=model_runner.token_to_kv_pool_allocator.get_kvcache(),

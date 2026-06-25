@@ -77,7 +77,7 @@ Client
 
 ### 5.1 C2KV Pool（`c2kv_pool.py`）
 
-一个内存中的、常驻 GPU 的 LRU cache，通过 `max_total_tokens` 进行容量限制（即所有条目的 `gist_len` 之和）。使用 `collections.OrderedDict` 实现 O(1) 的 LRU 提升。
+一个内存中的、常驻 GPU 的 LRU cache，通过 `max_total_tokens` 进行容量限制（即所有条目的 `gist_len` 之和）。K/V 和 position 存储会在启动时预分配，并复用 SGLang 的 `MHATokenToKVPool` 和 `TokenToKVPoolAllocator`。每个 entry 只保存申请到的 token index 和少量元数据；LRU 淘汰时将 index 归还 allocator，从而避免为每个 entry 长期保留独立 CUDA tensor。
 
 **关键设计选择——基于 token ID 计算 hash，而不是基于文本：**
 
@@ -122,7 +122,7 @@ def c2kv_gist_token_ids(key_hash: str, gist_len: int) -> List[int]:
 
 ### 5.3 Gist 注入（`c2kv_injection.py`）
 
-`inject_c2kv_gist(entry, position_cursor, loc, token_to_kv_pool, attn_layers, cos_sin_cache)`
+`inject_c2kv_gist(entry, c2kv_pool, position_cursor, loc, token_to_kv_pool, attn_layers, cos_sin_cache)`
 
 对于每一层：
 
