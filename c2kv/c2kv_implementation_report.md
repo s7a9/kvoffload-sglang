@@ -63,7 +63,7 @@ Client
 
 | File | Changes |
 |------|---------|
-| `server_args.py` | 4 new flags: `enable_c2kv`, `c2kv_gist_type`, `c2kv_gist_param`, `c2kv_pool_size` |
+| `server_args.py` | 5 new flags: `enable_c2kv`, `c2kv_gist_type`, `c2kv_gist_param`, `c2kv_pool_fraction`, `c2kv_max_tokens` |
 | `models/qwen3.py` | `gist_qkv_proj`, `forward_with_gist`, `generate_gist`, weight loader mappings |
 | `model_executor/model_runner.py` | `forward_c2kv_extract` pass-through |
 | `model_executor/forward_batch_info.py` | `c2kv_position_corrections` tensor + position patching |

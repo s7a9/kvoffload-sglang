@@ -826,11 +826,42 @@ class Scheduler(
 
         self.c2kv_pool = None
         if server_args.enable_c2kv:
-            from sglang.srt.mem_cache.c2kv_pool import C2KVPool
+            from sglang.srt.mem_cache.c2kv_pool import (
+                C2KVPool,
+                calculate_c2kv_pool_size,
+            )
 
-            self.c2kv_pool = C2KVPool(max_total_tokens=server_args.c2kv_pool_size)
+            model_runner = self.tp_worker.model_runner
+            total_memory_bytes = torch.cuda.get_device_properties(
+                self.gpu_id
+            ).total_memory
+            max_total_tokens, bytes_per_token = calculate_c2kv_pool_size(
+                total_memory_bytes=total_memory_bytes,
+                pool_fraction=server_args.c2kv_pool_fraction,
+                num_layers=model_runner.num_effective_layers,
+                num_kv_heads=self.model_config.get_num_kv_heads(
+                    self.attn_tp_group.world_size
+                ),
+                head_dim=self.model_config.head_dim,
+                value_head_dim=self.model_config.v_head_dim,
+                dtype=model_runner.dtype,
+            )
+            if max_total_tokens < 1:
+                raise ValueError(
+                    "--c2kv-pool-fraction is too small to hold one C2KV gist token."
+                )
+            self.c2kv_pool = C2KVPool(
+                max_total_tokens=max_total_tokens,
+                max_entry_tokens=server_args.c2kv_max_tokens,
+            )
             logger.info(
-                f"C2KV pool initialised (max_total_tokens={server_args.c2kv_pool_size})"
+                "C2KV pool initialised "
+                f"(fraction={server_args.c2kv_pool_fraction}, "
+                f"max_total_tokens={max_total_tokens}, "
+                f"max_entry_tokens={server_args.c2kv_max_tokens}, "
+                f"bytes_per_token={bytes_per_token}, "
+                f"memory_budget_gib="
+                f"{total_memory_bytes * server_args.c2kv_pool_fraction / (1 << 30):.2f})"
             )
 
         if (
@@ -2011,6 +2042,10 @@ class Scheduler(
             return C2KVExtractReqOutput(
                 error="input_ids is empty.", success=False
             )
+        if recv_req.compression_ratio <= 0:
+            return C2KVExtractReqOutput(
+                error="compression_ratio must be greater than 0.", success=False
+            )
 
         key_hash = self.c2kv_pool.compute_hash(recv_req.input_ids)
         self._log_c2kv_token_usage(
@@ -2033,6 +2068,17 @@ class Scheduler(
                 gist_len=existing.gist_len,
                 original_seq_len=existing.original_seq_len,
             )
+
+        expected_gist_len = (
+            len(recv_req.input_ids) + recv_req.compression_ratio - 1
+        ) // recv_req.compression_ratio
+        if expected_gist_len > self.c2kv_pool.max_entry_tokens:
+            error_msg = (
+                f"C2KV entry would have {expected_gist_len} gist tokens, exceeding "
+                f"--c2kv-max-tokens={self.c2kv_pool.max_entry_tokens}."
+            )
+            logger.warning(error_msg)
+            return C2KVExtractReqOutput(error=error_msg, success=False)
 
         # In overlap mode run_batch dispatches GPU work (including NCCL all-reduces)
         # onto forward_stream, while forward_c2kv_extract runs on schedule_stream.
@@ -2084,13 +2130,40 @@ class Scheduler(
             return C2KVExtractReqOutput(error=error_msg, success=False)
 
         original_seq_len = len(recv_req.input_ids)
-        entry = self.c2kv_pool.store(
-            key_hash=key_hash,
-            gist_key_values=gist_key_values,
-            gist_mask=gist_mask,
-            gist_position_ids=gist_position_ids,
-            original_seq_len=original_seq_len,
+        gist_len = gist_mask.shape[1]
+        fits_pool = gist_len <= min(
+            self.c2kv_pool.max_entry_tokens,
+            self.c2kv_pool.max_total_tokens,
         )
+        if self.tp_size > 1 and torch.distributed.is_initialized():
+            all_ranks_fit = torch.tensor([int(fits_pool)], dtype=torch.long)
+            torch.distributed.all_reduce(
+                all_ranks_fit,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_cpu_group,
+            )
+            fits_pool = bool(all_ranks_fit.item())
+        if not fits_pool:
+            error_msg = (
+                f"C2KV entry has {gist_len} gist tokens and exceeds the allowed "
+                "capacity on one or more TP ranks "
+                f"(per-entry limit: {self.c2kv_pool.max_entry_tokens}, "
+                f"local pool capacity: {self.c2kv_pool.max_total_tokens})."
+            )
+            logger.warning(error_msg)
+            return C2KVExtractReqOutput(error=error_msg, success=False)
+
+        try:
+            entry = self.c2kv_pool.store(
+                key_hash=key_hash,
+                gist_key_values=gist_key_values,
+                gist_mask=gist_mask,
+                gist_position_ids=gist_position_ids,
+                original_seq_len=original_seq_len,
+            )
+        except ValueError as e:
+            logger.warning("C2KV extract result does not fit in the pool: %s", e)
+            return C2KVExtractReqOutput(error=str(e), success=False)
         self._log_c2kv_token_usage(
             "extract_store",
             key_hash=key_hash[:16],

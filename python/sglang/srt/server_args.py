@@ -576,7 +576,8 @@ class ServerArgs:
     enable_c2kv: bool = False
     c2kv_gist_type: str = "dynamic-interleave"
     c2kv_gist_param: str = "qkv"
-    c2kv_pool_size: int = 4096
+    c2kv_pool_fraction: float = 0.01
+    c2kv_max_tokens: int = 65536
 
     # Ktransformers/AMX expert parallelism
     kt_weight_path: Optional[str] = None
@@ -759,6 +760,11 @@ class ServerArgs:
 
         # Validate SSL arguments early (before dummy-model short-circuit).
         self._handle_ssl_validation()
+
+        if not 0 < self.c2kv_pool_fraction <= 1:
+            raise ValueError("--c2kv-pool-fraction must be in the range (0, 1].")
+        if self.c2kv_max_tokens <= 0:
+            raise ValueError("--c2kv-max-tokens must be greater than 0.")
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -5230,10 +5236,17 @@ class ServerArgs:
             help="Which projections are gist-parameterised for C2KV (e.g. 'qkv').",
         )
         parser.add_argument(
-            "--c2kv-pool-size",
+            "--c2kv-pool-fraction",
+            type=float,
+            default=ServerArgs.c2kv_pool_fraction,
+            help="Fraction of total device memory used by the C2KV LRU pool. "
+            "This is additional to --mem-fraction-static.",
+        )
+        parser.add_argument(
+            "--c2kv-max-tokens",
             type=int,
-            default=ServerArgs.c2kv_pool_size,
-            help="Max gist tokens in the C2KV LRU pool across all entries.",
+            default=ServerArgs.c2kv_max_tokens,
+            help="Maximum number of gist tokens allowed in a single C2KV entry.",
         )
 
         # Ktransformer server args

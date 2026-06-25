@@ -58,7 +58,7 @@ Client
 
 | 文件 | 变更 |
 |------|------|
-| `server_args.py` | 新增 4 个参数：`enable_c2kv`、`c2kv_gist_type`、`c2kv_gist_param`、`c2kv_pool_size` |
+| `server_args.py` | 新增 5 个参数：`enable_c2kv`、`c2kv_gist_type`、`c2kv_gist_param`、`c2kv_pool_fraction`、`c2kv_max_tokens` |
 | `models/qwen3.py` | `gist_qkv_proj`、`forward_with_gist`、`generate_gist`、权重加载映射 |
 | `model_executor/model_runner.py` | `forward_c2kv_extract` 透传 |
 | `model_executor/forward_batch_info.py` | `c2kv_position_corrections` tensor + position 修正 |

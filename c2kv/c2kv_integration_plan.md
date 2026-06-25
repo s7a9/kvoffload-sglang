@@ -47,7 +47,8 @@ Add these fields to `ServerArgs` with defaults:
 enable_c2kv: bool = False
 c2kv_gist_type: str = "dynamic-interleave"
 c2kv_gist_param: str = "qkv"
-c2kv_pool_size: int = 4096
+c2kv_pool_fraction: float = 0.01
+c2kv_max_tokens: int = 4096
 ```
 
 Add corresponding CLI flags in the argument parser section:
@@ -56,7 +57,8 @@ Add corresponding CLI flags in the argument parser section:
 --enable-c2kv           (store_true)
 --c2kv-gist-type STR    (default: "dynamic-interleave")
 --c2kv-gist-param STR   (default: "qkv")
---c2kv-pool-size INT    (default: 4096)
+--c2kv-pool-fraction FLOAT    (default: 0.01)
+--c2kv-max-tokens INT         (default: 4096)
 ```
 
 **Verification:** `python -m sglang.launch_server --help` prints the four flags without error.
@@ -479,9 +481,13 @@ c2kv_position_corrections: Optional[List[int]] = None  # per-request correction,
 ```python
 self.c2kv_pool = None
 if server_args.enable_c2kv:
-    from sglang.srt.mem_cache.c2kv_pool import C2KVPool
-    self.c2kv_pool = C2KVPool(max_total_tokens=server_args.c2kv_pool_size)
-    logger.info(f"C2KV pool initialised (max_total_tokens={server_args.c2kv_pool_size})")
+    from sglang.srt.mem_cache.c2kv_pool import C2KVPool, calculate_c2kv_pool_size
+    max_total_tokens = calculate_c2kv_pool_size(...)
+    self.c2kv_pool = C2KVPool(
+        max_total_tokens=max_total_tokens,
+        max_entry_tokens=server_args.c2kv_max_tokens,
+    )
+    logger.info(f"C2KV pool initialised (max_total_tokens={max_total_tokens})")
 ```
 
 ---
@@ -825,7 +831,8 @@ text in a future chat completion.
 
 ```
 1. Start server:
-   python -m sglang.launch_server <model> --enable-c2kv --c2kv-pool-size 8192
+   python -m sglang.launch_server <model> --enable-c2kv \
+       --c2kv-pool-fraction 0.01 --c2kv-max-tokens 4096
 
 2. Extract a document:
    POST /v1/c2kv/extract

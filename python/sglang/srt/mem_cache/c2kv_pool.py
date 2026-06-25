@@ -14,6 +14,32 @@ from typing import List, Optional, Tuple
 import torch
 
 C2KV_GIST_TOKEN_BASE = 1 << 60
+C2KV_METADATA_BYTES_PER_TOKEN = (
+    torch.tensor([], dtype=torch.bool).element_size()
+    + torch.tensor([], dtype=torch.int64).element_size()
+)
+
+
+def calculate_c2kv_pool_size(
+    *,
+    total_memory_bytes: int,
+    pool_fraction: float,
+    num_layers: int,
+    num_kv_heads: int,
+    head_dim: int,
+    value_head_dim: int,
+    dtype: torch.dtype,
+) -> Tuple[int, int]:
+    """Return (max gist tokens, bytes per token) for a TP/PP-local C2KV pool."""
+    kv_bytes_per_token = (
+        num_layers
+        * num_kv_heads
+        * (head_dim + value_head_dim)
+        * torch.tensor([], dtype=dtype).element_size()
+    )
+    bytes_per_token = kv_bytes_per_token + C2KV_METADATA_BYTES_PER_TOKEN
+    memory_budget_bytes = int(total_memory_bytes * pool_fraction)
+    return memory_budget_bytes // bytes_per_token, bytes_per_token
 
 
 def c2kv_gist_token_ids(key_hash: str, gist_len: int) -> List[int]:
@@ -34,8 +60,13 @@ class C2KVEntry:
 
 
 class C2KVPool:
-    def __init__(self, max_total_tokens: int):
+    def __init__(
+        self, max_total_tokens: int, max_entry_tokens: Optional[int] = None
+    ):
         self.max_total_tokens = max_total_tokens
+        self.max_entry_tokens = (
+            max_total_tokens if max_entry_tokens is None else max_entry_tokens
+        )
         self._current_tokens = 0
         # OrderedDict: LRU order (MRU at end)
         self._cache: OrderedDict[str, C2KVEntry] = OrderedDict()
@@ -54,12 +85,22 @@ class C2KVPool:
         gist_position_ids: torch.Tensor,
         original_seq_len: int,
     ) -> C2KVEntry:
+        gist_len = gist_mask.shape[1]
+        if gist_len > self.max_entry_tokens:
+            raise ValueError(
+                f"C2KV entry has {gist_len} gist tokens, exceeding the per-entry "
+                f"limit of {self.max_entry_tokens} tokens."
+            )
+        if gist_len > self.max_total_tokens:
+            raise ValueError(
+                f"C2KV entry has {gist_len} gist tokens, exceeding the pool "
+                f"capacity of {self.max_total_tokens} tokens."
+            )
+
         # Remove existing entry with same key first
         if key_hash in self._cache:
             old = self._cache.pop(key_hash)
             self._current_tokens -= old.gist_len
-
-        gist_len = gist_mask.shape[1]
 
         # Evict LRU entries until the new entry fits
         while self._current_tokens + gist_len > self.max_total_tokens and self._cache:

@@ -48,6 +48,29 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
 
+class TestC2KVArgs(unittest.TestCase):
+    def test_c2kv_pool_fraction_default(self):
+        server_args = ServerArgs(model_path="dummy")
+        self.assertEqual(server_args.c2kv_pool_fraction, 0.01)
+        self.assertEqual(server_args.c2kv_max_tokens, 4096)
+
+    def test_c2kv_pool_fraction_validation(self):
+        for value in (0, -0.1, 1.1):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValueError, "--c2kv-pool-fraction must be"
+                ):
+                    ServerArgs(model_path="dummy", c2kv_pool_fraction=value)
+
+    def test_c2kv_max_tokens_validation(self):
+        for value in (0, -1):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValueError, "--c2kv-max-tokens must be"
+                ):
+                    ServerArgs(model_path="dummy", c2kv_max_tokens=value)
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
