@@ -1198,13 +1198,15 @@ class Scheduler(
             return batch
         batch.ne_token_table = self.token_table
         if batch.forward_mode == ForwardMode.EXTEND:
+            from sglang.srt.mem_cache.c2kv_pool import C2KV_GIST_TOKEN_BASE
+
             all_tokens = []
             column_starts = []
             request_lengths = []
             for req in batch.reqs:
                 start = len(req.prefix_indices)
                 end = start + req.extend_input_len
-                fill_ids = req.origin_input_ids + req.output_ids
+                fill_ids = req.fill_ids
                 if start == 0:
                     tokens = fill_ids[start:end]
                     column_starts.append(0)
@@ -1215,6 +1217,34 @@ class Scheduler(
                     # Prepend n-1 tokens before prefix_len for n-gram context
                     tokens = fill_ids[start - self.ngram_embedding_n + 1 : end]
                     column_starts.append(start - self.ngram_embedding_n + 1)
+                if getattr(req, "c2kv_rounds", None) is not None:
+                    tokens = [
+                        -1 if token >= C2KV_GIST_TOKEN_BASE else token
+                        for token in tokens
+                    ]
+                expected_len = end - column_starts[-1]
+                if len(tokens) != expected_len:
+                    logger.warning(
+                        "Ngram token-table update length mismatch: rid=%s, "
+                        "start=%s, end=%s, column_start=%s, expected_len=%s, "
+                        "actual_len=%s, fill_len=%s, origin_len=%s, "
+                        "extend_input_len=%s, c2kv_round=%s/%s",
+                        req.rid,
+                        start,
+                        end,
+                        column_starts[-1],
+                        expected_len,
+                        len(tokens),
+                        len(fill_ids),
+                        len(req.origin_input_ids),
+                        req.extend_input_len,
+                        getattr(req, "c2kv_round_idx", None),
+                        (
+                            len(req.c2kv_rounds)
+                            if getattr(req, "c2kv_rounds", None) is not None
+                            else None
+                        ),
+                    )
                 all_tokens.extend(tokens)
                 request_lengths.append(len(tokens))
             dtype = self.token_table.dtype
@@ -1983,7 +2013,7 @@ class Scheduler(
             self._log_c2kv_token_usage(
                 "generate_after_build_rounds",
                 req=req,
-                full_prompt_len=len(req.c2kv_full_origin_input_ids or []),
+                full_prompt_len=len(req.c2kv_virtual_input_ids or []),
                 round_lens=[len(round_info.tokens) for round_info in req.c2kv_rounds],
                 post_inject=[
                     list(round_info.post_inject_seg_indices)
@@ -2011,6 +2041,7 @@ class Scheduler(
                     {
                         "c2kv_pool_tokens": self.c2kv_pool.current_tokens(),
                         "c2kv_pool_entries": self.c2kv_pool.num_entries(),
+                        "c2kv_pool_pinned_entries": self.c2kv_pool.pinned_entries(),
                     }
                 )
             if req is not None:
@@ -2039,6 +2070,28 @@ class Scheduler(
             )
         except Exception:
             logger.debug("Failed to log C2KV token usage", exc_info=True)
+
+    def _release_c2kv_pins(self, req: "Req") -> None:
+        pinned_keys = getattr(req, "c2kv_pinned_keys", None)
+        if not pinned_keys:
+            return
+        if self.c2kv_pool is not None:
+            self.c2kv_pool.unpin_many(pinned_keys)
+        req.c2kv_pinned_keys = None
+        self._log_c2kv_token_usage(
+            "release_pins",
+            req=req,
+            released_keys=[key_hash[:16] for key_hash in pinned_keys],
+        )
+
+    def _cleanup_aborted_c2kv_waiting_req(self, req: "Req") -> None:
+        self._release_c2kv_pins(req)
+        if (
+            getattr(req, "c2kv_rounds", None) is not None
+            and req.req_pool_idx is not None
+            and not req.kv_committed_freed
+        ):
+            release_kv_cache(req, self.tree_cache, is_insert=False)
 
     def handle_extract_request(self, recv_req: "TokenizedExtractReqInput"):
         from sglang.srt.managers.io_struct import C2KVExtractReqOutput
@@ -2082,10 +2135,33 @@ class Scheduler(
         expected_gist_len = (
             len(recv_req.input_ids) + recv_req.compression_ratio - 1
         ) // recv_req.compression_ratio
-        if expected_gist_len > self.c2kv_pool.max_entry_tokens:
+        if expected_gist_len > min(
+            self.c2kv_pool.max_entry_tokens,
+            self.c2kv_pool.max_total_tokens,
+        ):
             error_msg = (
                 f"C2KV entry would have {expected_gist_len} gist tokens, exceeding "
-                f"--c2kv-max-tokens={self.c2kv_pool.max_entry_tokens}."
+                f"the allowed capacity (per-entry limit: "
+                f"{self.c2kv_pool.max_entry_tokens}, local pool capacity: "
+                f"{self.c2kv_pool.max_total_tokens})."
+            )
+            logger.warning(error_msg)
+            return C2KVExtractReqOutput(error=error_msg, success=False)
+        has_space = self.c2kv_pool.can_allocate(
+            expected_gist_len, existing_key=key_hash
+        )
+        if self.tp_size > 1 and torch.distributed.is_initialized():
+            all_ranks_have_space = torch.tensor([int(has_space)], dtype=torch.long)
+            torch.distributed.all_reduce(
+                all_ranks_have_space,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_cpu_group,
+            )
+            has_space = bool(all_ranks_have_space.item())
+        if not has_space:
+            error_msg = (
+                f"C2KV pool does not have enough unpinned space for the expected "
+                f"{expected_gist_len} gist tokens."
             )
             logger.warning(error_msg)
             return C2KVExtractReqOutput(error=error_msg, success=False)
@@ -2162,6 +2238,22 @@ class Scheduler(
             )
             logger.warning(error_msg)
             return C2KVExtractReqOutput(error=error_msg, success=False)
+        has_space = self.c2kv_pool.can_allocate(gist_len, existing_key=key_hash)
+        if self.tp_size > 1 and torch.distributed.is_initialized():
+            all_ranks_have_space = torch.tensor([int(has_space)], dtype=torch.long)
+            torch.distributed.all_reduce(
+                all_ranks_have_space,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_cpu_group,
+            )
+            has_space = bool(all_ranks_have_space.item())
+        if not has_space:
+            error_msg = (
+                f"C2KV pool does not have enough unpinned space for {gist_len} "
+                "gist tokens."
+            )
+            logger.warning(error_msg)
+            return C2KVExtractReqOutput(error=error_msg, success=False)
 
         try:
             entry = self.c2kv_pool.store(
@@ -2201,14 +2293,6 @@ class Scheduler(
         if self.c2kv_pool is None:
             return "C2KV not enabled."
 
-        entries = []
-        for seg in segments:
-            entry = self.c2kv_pool.get(seg.key_hash)
-            if entry is None:
-                logger.warning("C2KV cache miss: %s", seg.key_hash)
-                return f"C2KV cache miss: {seg.key_hash}"
-            entries.append(entry)
-
         prev_end = 0
         for seg in segments:
             if not (0 <= seg.token_start <= seg.token_end <= original_len):
@@ -2222,6 +2306,14 @@ class Scheduler(
                     f"{seg.token_start=} < previous token_end {prev_end}"
                 )
             prev_end = seg.token_end
+
+        entries = []
+        for seg in segments:
+            entry = self.c2kv_pool.get(seg.key_hash)
+            if entry is None:
+                logger.warning("C2KV cache miss: %s", seg.key_hash)
+                return f"C2KV cache miss: {seg.key_hash}"
+            entries.append(entry)
 
         rounds: list = []
         virtual_ids: list = []
@@ -2253,9 +2345,18 @@ class Scheduler(
         elif pending_seg_indices and rounds:
             rounds[-1].post_inject_seg_indices.extend(pending_seg_indices)
 
+        if not rounds:
+            return "C2KV request has no real tokens to drive gist injection."
+
+        pinned_keys = list(dict.fromkeys(seg.key_hash for seg in segments))
+        if not self.c2kv_pool.pin_many(pinned_keys):
+            return "C2KV cache miss while pinning segments."
+
         req.c2kv_rounds = rounds
         req.c2kv_round_idx = 0
-        req.c2kv_full_origin_input_ids = virtual_ids
+        req.c2kv_round_start_len = 0
+        req.c2kv_virtual_input_ids = virtual_ids
+        req.c2kv_pinned_keys = pinned_keys
 
         self._log_c2kv_token_usage(
             "build_rounds",
@@ -2270,11 +2371,8 @@ class Scheduler(
             post_inject=[
                 list(round_info.post_inject_seg_indices) for round_info in rounds
             ],
+            pinned_keys=[key_hash[:16] for key_hash in pinned_keys],
         )
-
-        if rounds and rounds[0].tokens:
-            req.origin_input_ids = rounds[0].tokens
-            req.fill_ids = list(rounds[0].tokens)
 
         return None
 
@@ -2520,6 +2618,7 @@ class Scheduler(
                 rid=req.rid,
             )
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
+            self._release_c2kv_pins(req)
             self.send_to_tokenizer.send_output(abort_req, req)
             return False
         return True
@@ -2570,6 +2669,7 @@ class Scheduler(
             ),
             req_to_abort,
         )
+        self._cleanup_aborted_c2kv_waiting_req(req_to_abort)
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
         return req_to_abort.rid == recv_req.rid
 
@@ -2596,6 +2696,7 @@ class Scheduler(
                     ),
                     req,
                 )
+                self._cleanup_aborted_c2kv_waiting_req(req)
                 deleted_reqs.add(req)
 
         if deleted_reqs:
@@ -2675,6 +2776,13 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def stash_chunked_request(self, req: Req):
+        if req.c2kv_rounds is not None and req.c2kv_round_idx < len(req.c2kv_rounds):
+            req.prefix_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : req.kv_committed_len
+            ].to(torch.int64)
+            req.already_computed = req.kv_committed_len
+            req.cache_protected_len = len(req.prefix_indices)
+            return
         self.tree_cache.cache_unfinished_req(req, chunked=True)
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -3126,6 +3234,7 @@ class Scheduler(
             self.new_token_ratio = new_token_ratio
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish
+                self._release_c2kv_pins(req)
                 self.send_to_tokenizer.send_output(
                     AbortReq(
                         finished_reason=abort_reason.to_json(),
@@ -3713,11 +3822,17 @@ class Scheduler(
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
             self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+            self._cleanup_aborted_c2kv_waiting_req(req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                release_kv_cache(req, self.tree_cache)
+                if not req.kv_committed_freed:
+                    release_kv_cache(
+                        req,
+                        self.tree_cache,
+                        is_insert=req.c2kv_rounds is None,
+                    )
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 release_req_to_metadata_buffer(
@@ -3728,6 +3843,7 @@ class Scheduler(
             if (
                 req.mamba_pool_idx is not None
                 and self.disaggregation_mode != DisaggregationMode.DECODE
+                and not req.kv_committed_freed
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")

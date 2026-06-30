@@ -89,7 +89,12 @@ class SchedulerOutputProcessorMixin:
             req.check_finished()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
-                release_kv_cache(req, self.tree_cache)
+                self._release_c2kv_pins(req)
+                release_kv_cache(
+                    req,
+                    self.tree_cache,
+                    is_insert=req.c2kv_rounds is None,
+                )
 
         # Note: Logprobs should be handled on the prefill engine.
         self.stream_output(batch.reqs, batch.return_logprob)
@@ -203,20 +208,13 @@ class SchedulerOutputProcessorMixin:
                                 from sglang.srt.managers.schedule_batch import FINISH_ABORT as _FA
 
                                 req.to_finish = _FA("C2KV injection failed")
-                                if req.c2kv_full_origin_input_ids is not None:
-                                    committed_virtual_ids = list(
-                                        req.c2kv_full_origin_input_ids[
-                                            : req.kv_committed_len
-                                        ]
-                                    )
-                                    req.origin_input_ids = committed_virtual_ids
-                                    req.fill_ids = committed_virtual_ids
                                 req.check_finished()
                                 self._log_c2kv_token_usage(
                                     "inject_abort_release_before",
                                     req=req,
                                     failed_seg_idx=seg_idx,
                                 )
+                                self._release_c2kv_pins(req)
                                 release_kv_cache(req, self.tree_cache, is_insert=False)
                                 self._log_c2kv_token_usage(
                                     "inject_abort_release_after",
@@ -242,9 +240,7 @@ class SchedulerOutputProcessorMixin:
                                 ].to(torch.int64)
                             )
                             req.already_computed = req.kv_committed_len
-
-                            # Only the next round's real tokens
-                            req.origin_input_ids = list(next_round.tokens)
+                            req.c2kv_round_start_len = req.kv_committed_len
 
                             # Release the tree lock from this round's PrefillAdder;
                             # the next round's PrefillAdder will re-acquire it.
@@ -256,16 +252,18 @@ class SchedulerOutputProcessorMixin:
                                 req=req,
                                 next_round_idx=req.c2kv_round_idx,
                                 next_round_len=len(next_round.tokens),
+                                prefix_indices_len=len(req.prefix_indices),
+                                round_start_len=req.c2kv_round_start_len,
+                                c2kv_virtual_len=(
+                                    len(req.c2kv_virtual_input_ids)
+                                    if req.c2kv_virtual_input_ids is not None
+                                    else None
+                                ),
                             )
 
                             req.c2kv_requeued = True
                             self.waiting_queue.insert(0, req)
                             continue
-
-                        # Last round done — restore full virtual sequence for decode
-                        if req.c2kv_full_origin_input_ids is not None:
-                            req.origin_input_ids = list(req.c2kv_full_origin_input_ids)
-                            req.fill_ids = list(req.c2kv_full_origin_input_ids)
 
                         # If gist was injected this round, batch.seq_lens is stale.
                         # Patch it so decode allocates at the correct position.
@@ -281,7 +279,13 @@ class SchedulerOutputProcessorMixin:
                             "all_rounds_finished",
                             req=req,
                             batch_seq_len=int(batch.seq_lens_cpu[i].item()),
+                            c2kv_virtual_len=(
+                                len(req.c2kv_virtual_input_ids)
+                                if req.c2kv_virtual_input_ids is not None
+                                else None
+                            ),
                         )
+                        self._release_c2kv_pins(req)
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
@@ -291,10 +295,16 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
-                        release_kv_cache(req, self.tree_cache)
+                        self._release_c2kv_pins(req)
+                        release_kv_cache(
+                            req,
+                            self.tree_cache,
+                            is_insert=req.c2kv_rounds is None,
+                        )
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        self.tree_cache.cache_unfinished_req(req)
+                        if req.c2kv_rounds is None:
+                            self.tree_cache.cache_unfinished_req(req)
                         if self.enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
@@ -416,6 +426,7 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
+                        self._release_c2kv_pins(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     else:
@@ -652,7 +663,12 @@ class SchedulerOutputProcessorMixin:
             else:
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                release_kv_cache(req, self.tree_cache)
+                self._release_c2kv_pins(req)
+                release_kv_cache(
+                    req,
+                    self.tree_cache,
+                    is_insert=req.c2kv_rounds is None,
+                )
 
             req.time_stats.set_completion_time()
 

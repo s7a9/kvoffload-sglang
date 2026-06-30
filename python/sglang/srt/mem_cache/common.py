@@ -476,6 +476,30 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         return
 
+    if getattr(req, "c2kv_rounds", None) is not None and not is_insert:
+        start_p = getattr(req, "c2kv_tree_cache_prefix_len", 0)
+        end_p = req.kv_allocated_len
+        if start_p < end_p:
+            indices_to_free = tree_cache.req_to_token_pool.req_to_token[
+                req.req_pool_idx, start_p:end_p
+            ]
+            tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
+
+        if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
+            not tree_cache.supports_mamba()
+        ):
+            assert (
+                req.mamba_pool_idx is not None
+            ), "mamba state is freed while the tree cache does not manage mamba states"
+            tree_cache.req_to_token_pool.free_mamba_cache(req)
+
+        if req.last_node is not None:
+            tree_cache.dec_lock_ref(req.last_node)
+        tree_cache.req_to_token_pool.free(req)
+        req.kv_committed_freed = True
+        req.kv_overallocated_freed = True
+        return
+
     tree_cache.cache_finished_req(req, is_insert=is_insert)
 
     # FIXME: SessionAwareCache.cache_finished_req sets req_pool_idx = None to

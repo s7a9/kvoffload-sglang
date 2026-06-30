@@ -193,15 +193,19 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
-            # C2KV multi-round requests in active rounds have prefix_indices
-            # set by the output processor to reference injected gist KV slots.
-            # Overwriting them with a tree-cache match would lose the gist
-            # state and cause length mismatches in prepare_for_extend.
             c2kv_rounds = getattr(r, "c2kv_rounds", None)
-            if c2kv_rounds is not None and 0 < getattr(r, "c2kv_round_idx", 0) < len(c2kv_rounds):
-                continue
-
-            prefix_ids = r.origin_input_ids + r.output_ids
+            c2kv_round_idx = getattr(r, "c2kv_round_idx", 0)
+            if c2kv_rounds is not None and c2kv_round_idx < len(c2kv_rounds):
+                # Before the first gist injection, the first round is just a
+                # normal real-token prefix and can safely hit the radix cache.
+                # Later rounds already carry C2KV-injected KV slots in
+                # prefix_indices, so a tree-cache match would overwrite them.
+                if c2kv_round_idx == 0 and r.kv_committed_len == 0:
+                    prefix_ids = c2kv_rounds[0].tokens
+                else:
+                    continue
+            else:
+                prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             # NOTE: the prefix_indices must always be aligned with last_node
             match_result = self.tree_cache.match_prefix(
@@ -220,6 +224,16 @@ class SchedulePolicy:
                 match_result.last_host_node,
                 match_result.host_hit_length,
             )
+            if (
+                c2kv_rounds is not None
+                and c2kv_round_idx == 0
+                and r.kv_committed_len == 0
+            ):
+                if match_result.cache_protected_len is not None:
+                    r.c2kv_tree_cache_prefix_len = match_result.cache_protected_len
+                else:
+                    r.c2kv_tree_cache_prefix_len = len(r.prefix_indices)
+                r.cache_protected_len = r.c2kv_tree_cache_prefix_len
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from
@@ -768,6 +782,35 @@ class PrefillAdder:
         real_input_tokens = req.extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
+        c2kv_rounds = getattr(req, "c2kv_rounds", None)
+        if c2kv_rounds is not None and getattr(req, "c2kv_round_idx", 0) < len(
+            c2kv_rounds
+        ):
+            logger.info(
+                "C2KV PrefillAdder add_one_req: rid=%s, round=%s/%s, "
+                "prefix_len=%s, kv_committed_len=%s, fill_len=%s, origin_len=%s, "
+                "round_start_len=%s, consumed_round_tokens=%s, extend_input_len=%s, "
+                "host_hit_length=%s, rem_chunk_tokens=%s, rem_input_tokens=%s, "
+                "rem_total_tokens=%s, c2kv_requeued=%s",
+                req.rid,
+                req.c2kv_round_idx,
+                len(c2kv_rounds),
+                prefix_len,
+                req.kv_committed_len,
+                len(req.fill_ids),
+                len(req.origin_input_ids),
+                getattr(req, "c2kv_round_start_len", 0),
+                max(
+                    req.kv_committed_len - getattr(req, "c2kv_round_start_len", 0),
+                    0,
+                ),
+                req.extend_input_len,
+                req.host_hit_length,
+                self.rem_chunk_tokens,
+                self.rem_input_tokens,
+                self.rem_total_tokens,
+                getattr(req, "c2kv_requeued", None),
+            )
 
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
@@ -842,6 +885,21 @@ class PrefillAdder:
                 # Chunked prefill
                 req.set_extend_input_len(trunc_len)
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
+                if c2kv_rounds is not None and getattr(
+                    req, "c2kv_round_idx", 0
+                ) < len(c2kv_rounds):
+                    logger.info(
+                        "C2KV PrefillAdder chunked req: rid=%s, round=%s/%s, "
+                        "prefix_len=%s, trunc_len=%s, fill_len_after=%s, "
+                        "extend_input_len=%s",
+                        req.rid,
+                        req.c2kv_round_idx,
+                        len(c2kv_rounds),
+                        len(req.prefix_indices),
+                        trunc_len,
+                        len(req.fill_ids),
+                        req.extend_input_len,
+                    )
 
                 self.can_run_list.append(req)
                 self.new_chunked_req = req

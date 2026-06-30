@@ -8,7 +8,7 @@ indices and lightweight metadata, avoiding long-lived per-entry CUDA tensors.
 
 import hashlib
 import struct
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -124,6 +124,7 @@ class C2KVPool:
         self._current_tokens = 0
         # OrderedDict: LRU order (MRU at end)
         self._cache: OrderedDict[str, C2KVEntry] = OrderedDict()
+        self._pin_counts: Counter[str] = Counter()
 
     @staticmethod
     def compute_hash(token_ids: List[int]) -> str:
@@ -204,12 +205,32 @@ class C2KVPool:
 
     def _evict_one(self, exclude_key: Optional[str] = None) -> bool:
         for key_hash, entry in list(self._cache.items()):
-            if key_hash == exclude_key:
+            if key_hash == exclude_key or self._pin_counts.get(key_hash, 0) > 0:
                 continue
             del self._cache[key_hash]
             self.allocator.free(entry.token_indices)
             self._current_tokens -= entry.gist_len
             return True
+        return False
+
+    def can_allocate(self, gist_len: int, existing_key: Optional[str] = None) -> bool:
+        """Return whether store() can allocate after evicting unpinned entries."""
+        existing = self._cache.get(existing_key) if existing_key is not None else None
+        if existing is not None:
+            extra_len = max(gist_len - existing.gist_len, 0)
+        else:
+            extra_len = gist_len
+        if extra_len <= self.allocator.available_size():
+            return True
+
+        needed = extra_len - self.allocator.available_size()
+        evictable_tokens = 0
+        for key_hash, entry in self._cache.items():
+            if key_hash == existing_key or self._pin_counts.get(key_hash, 0) > 0:
+                continue
+            evictable_tokens += entry.gist_len
+            if evictable_tokens >= needed:
+                return True
         return False
 
     def _allocate_for_store(
@@ -298,6 +319,35 @@ class C2KVPool:
             return None
         self._cache.move_to_end(key_hash)
         return entry
+
+    def pin(self, key_hash: str) -> bool:
+        if key_hash not in self._cache:
+            return False
+        self._pin_counts[key_hash] += 1
+        return True
+
+    def pin_many(self, key_hashes: List[str]) -> bool:
+        unique_keys = list(dict.fromkeys(key_hashes))
+        missing = [key_hash for key_hash in unique_keys if key_hash not in self._cache]
+        if missing:
+            return False
+        for key_hash in unique_keys:
+            self._pin_counts[key_hash] += 1
+        return True
+
+    def unpin(self, key_hash: str) -> None:
+        count = self._pin_counts.get(key_hash, 0)
+        if count <= 1:
+            self._pin_counts.pop(key_hash, None)
+        else:
+            self._pin_counts[key_hash] = count - 1
+
+    def unpin_many(self, key_hashes: List[str]) -> None:
+        for key_hash in dict.fromkeys(key_hashes):
+            self.unpin(key_hash)
+
+    def pinned_entries(self) -> int:
+        return len(self._pin_counts)
 
     def get_position_ids(self, entry: C2KVEntry) -> torch.Tensor:
         return self.position_buffer[entry.token_indices]

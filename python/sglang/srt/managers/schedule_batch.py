@@ -889,9 +889,12 @@ class Req(ReqDllmMixin):
         self.c2kv_segments = None           # List[C2KVSegmentInfo], sorted by token_start
         self.c2kv_rounds = None             # List[C2KVPrefillRound]
         self.c2kv_round_idx = 0
+        self.c2kv_round_start_len = 0       # KV length before the active round's real tokens
         self.c2kv_position_correction = 0  # running sum: original_seq_len - gist_len
-        self.c2kv_full_origin_input_ids = None  # virtual token IDs including gist synthetic IDs
+        self.c2kv_virtual_input_ids = None  # virtual token IDs including synthetic gist IDs
         self.c2kv_requeued = False              # True while waiting for next round
+        self.c2kv_pinned_keys = None        # Unique C2KV keys pinned while rounds inject
+        self.c2kv_tree_cache_prefix_len = 0  # Prefix slots owned by radix/tree cache
 
     @property
     def seqlen(self) -> int:
@@ -955,30 +958,88 @@ class Req(ReqDllmMixin):
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    def prepare_c2kv_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
+        """Build the transient fill_ids view for the active C2KV prefill round."""
+        self.c2kv_requeued = False
+        self.host_hit_length = 0
+        root_node = getattr(tree_cache, "root_node", None)
+        if self.last_node is None and root_node is not None:
+            self.last_node = root_node
+        if self.last_host_node is None and root_node is not None:
+            self.last_host_node = root_node
+
+        prefix_len = max(self.kv_committed_len, len(self.prefix_indices))
+        virtual_input_ids = self.c2kv_virtual_input_ids
+        if virtual_input_ids is None or prefix_len > len(virtual_input_ids):
+            logger.warning(
+                "C2KV round input has no usable virtual prefix: "
+                "rid=%s, round=%s/%s, kv_committed_len=%s, "
+                "prefix_indices_len=%s, virtual_len=%s, origin_len=%s, "
+                "fill_len_before=%s",
+                self.rid,
+                self.c2kv_round_idx,
+                len(self.c2kv_rounds),
+                self.kv_committed_len,
+                len(self.prefix_indices),
+                None if virtual_input_ids is None else len(virtual_input_ids),
+                len(self.origin_input_ids),
+                len(self.fill_ids),
+            )
+            prefix_len = 0
+
+        cur_round = self.c2kv_rounds[self.c2kv_round_idx]
+        round_tokens = cur_round.tokens
+        round_start_len = getattr(self, "c2kv_round_start_len", 0)
+        consumed_round_tokens = max(prefix_len - round_start_len, 0)
+        if consumed_round_tokens > len(round_tokens):
+            logger.warning(
+                "C2KV round consumed more tokens than the active round: "
+                "rid=%s, round=%s/%s, kv_committed_len=%s, "
+                "round_start_len=%s, consumed_round_tokens=%s, round_len=%s",
+                self.rid,
+                self.c2kv_round_idx,
+                len(self.c2kv_rounds),
+                self.kv_committed_len,
+                round_start_len,
+                consumed_round_tokens,
+                len(round_tokens),
+            )
+            consumed_round_tokens = len(round_tokens)
+
+        remaining_input_ids = round_tokens[consumed_round_tokens:]
+        self.fill_ids = (
+            list(virtual_input_ids[:prefix_len]) if prefix_len > 0 else []
+        ) + list(remaining_input_ids)
+        self.set_extend_input_len(len(remaining_input_ids))
+        logger.info(
+            "C2KV round input prepared: rid=%s, round=%s/%s, "
+            "kv_committed_len=%s, prefix_indices_len=%s, virtual_prefix_len=%s, "
+            "round_start_len=%s, consumed_round_tokens=%s, origin_len=%s, "
+            "round_len=%s, remaining_len=%s, fill_len=%s, extend_input_len=%s",
+            self.rid,
+            self.c2kv_round_idx,
+            len(self.c2kv_rounds),
+            self.kv_committed_len,
+            len(self.prefix_indices),
+            prefix_len,
+            round_start_len,
+            consumed_round_tokens,
+            len(self.origin_input_ids),
+            len(round_tokens),
+            len(remaining_input_ids),
+            len(self.fill_ids),
+            self.extend_input_len,
+        )
+
     def init_next_round_input(
         self,
         tree_cache: Optional[BasePrefixCache] = None,
         cow_mamba: Optional[bool] = None,
     ):
-        # C2KV multi-round: only during active rounds (not after completion).
-        # prefix_indices was set by re-queue code; skip tree_cache match.
-        if (
-            self.c2kv_rounds is not None
-            and 0 < self.c2kv_round_idx < len(self.c2kv_rounds)
+        if self.c2kv_rounds is not None and self.c2kv_round_idx < len(
+            self.c2kv_rounds
         ):
-            self.c2kv_requeued = False
-            self.host_hit_length = 0
-            # Use kv_committed_len as the authoritative prefix length.
-            # len(prefix_indices) should agree, but _compute_prefix_matches
-            # may have overwritten prefix_indices in cache-aware policies.
-            prefix_len = self.kv_committed_len
-            virtual_prefix = self.c2kv_full_origin_input_ids
-            if virtual_prefix is None or prefix_len > len(virtual_prefix):
-                prefix_len = 0
-            self.fill_ids = (
-                list(virtual_prefix[:prefix_len]) if prefix_len > 0 else []
-            ) + list(self.origin_input_ids)
-            self.set_extend_input_len(len(self.origin_input_ids))
+            self.prepare_c2kv_round_input(tree_cache)
             return
 
         if self.is_dllm():
@@ -1665,6 +1726,38 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
+            if seq_len - pre_len != req.extend_input_len:
+                logger.error(
+                    "prepare_for_extend length mismatch: rid=%s, batch_idx=%s, "
+                    "seq_len=%s, prefix_len=%s, extend_input_len=%s, "
+                    "fill_len=%s, origin_len=%s, output_len=%s, "
+                    "kv_committed_len=%s, kv_allocated_len=%s, already_computed=%s, "
+                    "c2kv_round=%s/%s, c2kv_requeued=%s, c2kv_virtual_len=%s",
+                    req.rid,
+                    i,
+                    seq_len,
+                    pre_len,
+                    req.extend_input_len,
+                    len(req.fill_ids),
+                    len(req.origin_input_ids),
+                    len(req.output_ids),
+                    req.kv_committed_len,
+                    req.kv_allocated_len,
+                    req.already_computed,
+                    getattr(req, "c2kv_round_idx", None),
+                    (
+                        len(req.c2kv_rounds)
+                        if getattr(req, "c2kv_rounds", None) is not None
+                        else None
+                    ),
+                    getattr(req, "c2kv_requeued", None),
+                    (
+                        len(req.c2kv_virtual_input_ids)
+                        if getattr(req, "c2kv_virtual_input_ids", None)
+                        is not None
+                        else None
+                    ),
+                )
             assert seq_len - pre_len == req.extend_input_len, (
                 f"seq_len({seq_len}) - pre_len({pre_len}) = {seq_len - pre_len} "
                 f"!= extend_input_len({req.extend_input_len}), "
