@@ -1141,6 +1141,19 @@ class PrefillAdder:
         )
 
         # adjusting the input_tokens based on host_hit_length and page_size
+        max_host_hit_length = max(0, req.extend_input_len)
+        if req.host_hit_length > max_host_hit_length:
+            logger.warning(
+                "Clamp host_hit_length from %s to %s for rid=%s, "
+                "prefix_len=%s, fill_len=%s, extend_input_len=%s",
+                req.host_hit_length,
+                max_host_hit_length,
+                req.rid,
+                len(req.prefix_indices),
+                len(req.fill_ids),
+                req.extend_input_len,
+            )
+            req.host_hit_length = max_host_hit_length
         real_input_tokens = req.extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
@@ -1157,10 +1170,12 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
 
             if req.host_hit_length > 0:
+                load_back_quota = self.rem_input_tokens - int(len(self.can_run_list) != 0)
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         last_host_node=req.last_host_node,
                         host_hit_length=req.host_hit_length,
+                        mem_quota=max(load_back_quota, 0),
                         req=req,
                     )
                 )

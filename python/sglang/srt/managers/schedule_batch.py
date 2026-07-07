@@ -109,6 +109,23 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 logger = logging.getLogger(__name__)
 
 
+def _device_copy_with_context(
+    tensor: torch.Tensor,
+    device: Union[str, torch.device],
+    *,
+    field_name: str,
+    context: str,
+) -> torch.Tensor:
+    try:
+        return tensor.to(device, non_blocking=True)
+    except Exception as err:
+        raise RuntimeError(
+            f"Failed to move {field_name} to {device}: "
+            f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+            f"pinned={tensor.is_pinned()}, context=({context})"
+        ) from err
+
+
 @lru_cache(maxsize=1)
 def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
     if vocab_size > MM_PAD_SHIFT_VALUE:
@@ -1515,6 +1532,46 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
+        bad_reqs = [
+            (
+                r.rid,
+                len(r.fill_ids),
+                len(r.prefix_indices),
+                r.extend_input_len,
+                len(ids),
+            )
+            for r, ids in zip(reqs, input_ids)
+            if len(r.prefix_indices) > len(r.fill_ids)
+            or r.extend_input_len != len(ids)
+        ]
+        if bad_reqs:
+            raise RuntimeError(
+                "Invalid extend batch: each request must satisfy "
+                "prefix_len <= fill_len and extend_input_len == fill_len - prefix_len. "
+                f"bad_reqs={bad_reqs[:8]}"
+            )
+        cuda_context = ""
+        if torch.cuda.is_available():
+            cuda_context = (
+                f", current_cuda={torch.cuda.current_device()}, "
+                f"cuda_count={torch.cuda.device_count()}"
+            )
+        copy_context = (
+            f"batch_size={len(reqs)}, extend_num_tokens={extend_num_tokens}, "
+            f"device={self.device}{cuda_context}"
+        )
+        for r, seq_len, prefix_len, extend_len in zip(
+            reqs, seq_lens, prefix_lens, extend_lens
+        ):
+            expected_extend_len = seq_len - prefix_len
+            if prefix_len > seq_len or extend_len != expected_extend_len:
+                raise RuntimeError(
+                    "Invalid extend request state before CUDA tensor creation: "
+                    f"rid={r.rid}, seq_len={seq_len}, prefix_len={prefix_len}, "
+                    f"extend_input_len={extend_len}, expected_extend_len={expected_extend_len}, "
+                    f"host_hit_length={getattr(r, 'host_hit_length', None)}, "
+                    f"storage_hit_length={getattr(r, 'storage_hit_length', None)}"
+                )
 
         # For matryoshka embeddings
         if self.model_config.is_matryoshka and any(
@@ -1530,22 +1587,38 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ]
 
         _pin = is_pin_memory_available(self.device)
-        input_ids_tensor = torch.tensor(
-            list(chain.from_iterable(input_ids)), dtype=torch.int64, pin_memory=_pin
-        ).to(self.device, non_blocking=True)
-        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
-            self.device, non_blocking=True
+        input_ids_tensor = _device_copy_with_context(
+            torch.tensor(
+                list(chain.from_iterable(input_ids)),
+                dtype=torch.int64,
+                pin_memory=_pin,
+            ),
+            self.device,
+            field_name="input_ids",
+            context=copy_context,
+        )
+        seq_lens_tensor = _device_copy_with_context(
+            torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin),
+            self.device,
+            field_name="seq_lens",
+            context=copy_context,
         )
         seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
-        orig_seq_lens_tensor = torch.tensor(
-            orig_seq_lens, dtype=torch.int32, pin_memory=_pin
-        ).to(self.device, non_blocking=True)
+        orig_seq_lens_tensor = _device_copy_with_context(
+            torch.tensor(orig_seq_lens, dtype=torch.int32, pin_memory=_pin),
+            self.device,
+            field_name="orig_seq_lens",
+            context=copy_context,
+        )
 
         token_type_ids_tensor = None
         if len(token_type_ids) > 0:
-            token_type_ids_tensor = torch.tensor(
-                sum(token_type_ids, []), dtype=torch.int64, pin_memory=_pin
-            ).to(self.device, non_blocking=True)
+            token_type_ids_tensor = _device_copy_with_context(
+                torch.tensor(sum(token_type_ids, []), dtype=torch.int64, pin_memory=_pin),
+                self.device,
+                field_name="token_type_ids",
+                context=copy_context,
+            )
 
         # Set batch fields needed by alloc_for_extend
         self.prefix_lens = prefix_lens
@@ -1685,8 +1758,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = orig_seq_lens_tensor
         self.out_cache_loc = out_cache_loc
         self.input_embeds = (
-            torch.tensor(input_embeds, pin_memory=_pin).to(
-                self.device, non_blocking=True
+            _device_copy_with_context(
+                torch.tensor(input_embeds, pin_memory=_pin),
+                self.device,
+                field_name="input_embeds",
+                context=copy_context,
             )
             if input_embeds
             else None
