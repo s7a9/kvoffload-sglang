@@ -73,6 +73,7 @@ docker run --rm -it \
   -e MODEL_PATH=/models/model \
   -e HOST=0.0.0.0 \
   -e PORT=30000 \
+  -e SGLANG_DISABLE_PIN_MEMORY=1 \
   -e SGLANG_ARGS='--tp-size 8 --ep-size 8 --dtype auto --trust-remote-code --tool-call-parser minimax-m2 --reasoning-parser minimax-append-think --max-running-requests 128 --mem-fraction-static 0.6 --enable-hierarchical-cache --hicache-size 40 --kv-offload-policy paper_v1' \
   tokenflow-sglang:cuda12.8
 ```
@@ -92,6 +93,22 @@ KV offload 的关键参数是：
 ```
 
 这有助于 host KV cache 相关内存注册或锁页场景，尤其是大 cache 或高吞吐实验时。
+
+如果启动时报错停在很小的 `input_ids` CPU 到 CUDA 拷贝，例如 `Failed to move input_ids to cuda: shape=(6,), pinned=True`，优先加上：
+
+```bash
+-e SGLANG_DISABLE_PIN_MEMORY=1
+```
+
+这会禁用 PyTorch pinned-memory host tensor 路径，绕开部分 Docker/CUDA 运行时组合下的 `cudaErrorInvalidValue`。
+
+也可以先用同一个镜像做最小自检：
+
+```bash
+docker run --rm -it --gpus all --ipc host --ulimit memlock=-1 --cap-add IPC_LOCK \
+  --entrypoint python3 tokenflow-sglang:cuda12.8 -c \
+  'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.device_count()); x=torch.tensor([1,2,3,4,5,6], dtype=torch.int64, pin_memory=True); print(x.is_pinned()); print(x.to("cuda", non_blocking=True)); torch.cuda.synchronize()'
+```
 
 ## 4. KV Offload 额外参数怎么传
 

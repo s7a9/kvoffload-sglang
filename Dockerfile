@@ -9,6 +9,8 @@ RUN mkdir -p /workspace/sglang && \
     cd /workspace/sglang && \
     tar -xzf /tmp/tokenflow-sglang.tar.gz
 
+COPY python /workspace/sglang/python
+
 WORKDIR /workspace/sglang
 
 RUN apt-get update && apt-get install -y \

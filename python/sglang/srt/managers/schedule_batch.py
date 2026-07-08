@@ -122,7 +122,8 @@ def _device_copy_with_context(
         raise RuntimeError(
             f"Failed to move {field_name} to {device}: "
             f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
-            f"pinned={tensor.is_pinned()}, context=({context})"
+            f"pinned={tensor.is_pinned()}, context=({context}), "
+            f"original_error={err!r}"
         ) from err
 
 
