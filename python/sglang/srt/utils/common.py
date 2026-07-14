@@ -602,8 +602,6 @@ def get_available_gpu_memory(
 
 
 def is_pin_memory_available(device=None) -> bool:
-    if envs.SGLANG_DISABLE_PIN_MEMORY.get():
-        return False
     if not torch.cuda.is_available():
         return False
     if device is not None and str(device) == "cpu":

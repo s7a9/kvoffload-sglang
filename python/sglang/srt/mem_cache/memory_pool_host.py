@@ -37,8 +37,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
-from sglang.srt.environ import envs
-from sglang.srt.utils import check_cuda_result, is_cuda, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -121,10 +120,8 @@ def alloc_with_host_register(
     """
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
-        check_cuda_result(
-            torch.cuda.cudart().cudaHostRegister(
-                buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
-            )
+        torch.cuda.cudart().cudaHostRegister(
+            buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
         )
     return buffer
 
@@ -167,7 +164,7 @@ class HostKVCache(abc.ABC):
         self.device_pool = device_pool
         self.page_size = page_size
         self.layout = layout
-        self.pin_memory = pin_memory and not envs.SGLANG_DISABLE_PIN_MEMORY.get()
+        self.pin_memory = pin_memory
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
 
