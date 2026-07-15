@@ -2729,15 +2729,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         compression_ratio: int,
     ):
         """
-        Run C2KV gist extraction for one document.
+        Run C2KV extraction for one document.
 
         Returns:
-            gist_key_values: List[(K, V)] per layer
-            gist_mask: (1, gist_len) bool
-            gist_position_ids: (1, gist_len) int64
+            key_values: List[(K, V)] per layer
+            token_mask: (1, stored_len) bool
+            position_ids: (1, stored_len) int64
         """
+        compression_ratio = self.get_c2kv_compression_ratio(compression_ratio)
+        if getattr(self.model, "full_length_pic", False):
+            return self.model.generate_pic(
+                input_ids, attention_mask, ratio=compression_ratio
+            )
         return self.model.generate_gist(
             input_ids, attention_mask, ratio=compression_ratio
+        )
+
+    def get_c2kv_compression_ratio(self, requested_ratio: int) -> int:
+        from sglang.srt.mem_cache.gist_utils import resolve_c2kv_compression_ratio
+
+        return resolve_c2kv_compression_ratio(
+            requested_ratio,
+            full_length_pic=getattr(self.model, "full_length_pic", False),
         )
 
     def forward(

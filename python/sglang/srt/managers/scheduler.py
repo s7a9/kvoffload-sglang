@@ -2105,17 +2105,21 @@ class Scheduler(
             return C2KVExtractReqOutput(
                 error="input_ids is empty.", success=False
             )
-        if recv_req.compression_ratio <= 0:
-            return C2KVExtractReqOutput(
-                error="compression_ratio must be greater than 0.", success=False
+        model_runner = self.tp_worker.model_runner
+        try:
+            compression_ratio = model_runner.get_c2kv_compression_ratio(
+                recv_req.compression_ratio
             )
+        except ValueError as e:
+            return C2KVExtractReqOutput(error=str(e), success=False)
 
         key_hash = self.c2kv_pool.compute_hash(recv_req.input_ids)
         self._log_c2kv_token_usage(
             "extract_request",
             key_hash=key_hash[:16],
             input_len=len(recv_req.input_ids),
-            compression_ratio=recv_req.compression_ratio,
+            compression_ratio=compression_ratio,
+            requested_compression_ratio=recv_req.compression_ratio,
         )
 
         existing = self.c2kv_pool.get(key_hash)
@@ -2133,8 +2137,8 @@ class Scheduler(
             )
 
         expected_gist_len = (
-            len(recv_req.input_ids) + recv_req.compression_ratio - 1
-        ) // recv_req.compression_ratio
+            len(recv_req.input_ids) + compression_ratio - 1
+        ) // compression_ratio
         if expected_gist_len > min(
             self.c2kv_pool.max_entry_tokens,
             self.c2kv_pool.max_total_tokens,
@@ -2188,7 +2192,7 @@ class Scheduler(
         try:
             gist_key_values, gist_mask, gist_position_ids = (
                 self.tp_worker.model_runner.forward_c2kv_extract(
-                    input_ids, attention_mask, recv_req.compression_ratio
+                    input_ids, attention_mask, compression_ratio
                 )
             )
         except Exception as e:

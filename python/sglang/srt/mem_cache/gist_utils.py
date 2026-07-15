@@ -10,12 +10,62 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import torch
-from torch.nn.attention.flex_attention import create_block_mask
-from torch.nn.attention.flex_attention import FlexKernelOptions
+from torch.nn.attention.flex_attention import FlexKernelOptions, create_block_mask
 
 C2KV_KERNEL_OPTIONS = FlexKernelOptions(
     FORCE_USE_FLEX_ATTENTION=True,
 )
+
+PIC_KERNEL_OPTIONS = FlexKernelOptions(
+    FORCE_USE_FLEX_ATTENTION=True,
+    BACKEND="FLASH",
+)
+
+
+def resolve_c2kv_compression_ratio(
+    requested_ratio: int, *, full_length_pic: bool
+) -> int:
+    """Return the storage ratio used by the active C2KV representation."""
+    if requested_ratio <= 0:
+        raise ValueError("compression_ratio must be greater than 0.")
+    return 1 if full_length_pic else requested_ratio
+
+
+def prepare_pic_input(input_ids, attention_mask):
+    """Build causal attention metadata for full-length, unpadded PIC extraction."""
+    if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+        raise ValueError(
+            "PIC extraction currently requires input_ids with shape (1, seq_len), "
+            f"got {tuple(input_ids.shape)}."
+        )
+    if attention_mask.shape != input_ids.shape:
+        raise ValueError(
+            "PIC attention_mask shape must match input_ids: "
+            f"{tuple(attention_mask.shape)} != {tuple(input_ids.shape)}."
+        )
+    if not bool(attention_mask.bool().all().item()):
+        raise ValueError("PIC extraction currently requires an unpadded document.")
+
+    seq_len = input_ids.shape[1]
+    if seq_len == 0:
+        raise ValueError("PIC extraction requires at least one token.")
+
+    def causal_mask(batch_idx, head_idx, q_idx, kv_idx):
+        return q_idx >= kv_idx
+
+    block_mask = create_block_mask(
+        causal_mask,
+        B=1,
+        H=None,
+        Q_LEN=seq_len,
+        KV_LEN=seq_len,
+        device=input_ids.device,
+    )
+    pic_mask = torch.ones((1, seq_len), dtype=torch.bool, device=input_ids.device)
+    position_ids = torch.arange(
+        seq_len, dtype=torch.long, device=input_ids.device
+    ).unsqueeze(0)
+    return block_mask, pic_mask, position_ids
 
 
 @dataclass

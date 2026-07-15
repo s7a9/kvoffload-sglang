@@ -1,14 +1,17 @@
 # Adapted from qwen2.py
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from functools import partial
 
 import torch
 from torch import nn
+from torch.nn.attention.flex_attention import flex_attention
 
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
@@ -22,6 +25,14 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.mem_cache.gist_utils import (
+    C2KV_KERNEL_OPTIONS,
+    GistConfig,
+    PIC_KERNEL_OPTIONS,
+    get_apply_gist_residual_func,
+    get_prepare_gist_input_func,
+    prepare_pic_input,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -57,17 +68,6 @@ if _is_npu:
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
 
 
-# C2KV related imports
-from sglang.srt.mem_cache.gist_utils import (
-    GistConfig,
-    get_apply_gist_residual_func,
-    get_prepare_gist_input_func,
-    C2KV_KERNEL_OPTIONS,
-)
-from torch.nn.attention.flex_attention import flex_attention
-from sglang.srt.distributed import tensor_model_parallel_all_reduce
-
-
 class Qwen3Attention(nn.Module):
     def __init__(
         self,
@@ -82,6 +82,8 @@ class Qwen3Attention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         rms_norm_eps: float = None,
         attention_bias: bool = False,
+        pic_enabled: bool = False,
+        pic_param: str = "qkv",
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
@@ -145,8 +147,17 @@ class Qwen3Attention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
+        self.pic_enabled = pic_enabled
+        self.pic_param = pic_param.lower()
+        if not self.pic_param or set(self.pic_param) - set("qkv"):
+            raise ValueError(
+                "pic_param must be a non-empty combination of q, k, and v; "
+                f"got {pic_param!r}."
+            )
+
         if get_global_server_args().enable_c2kv:
-            self.gist_qkv_proj = QKVParallelLinear(
+            c2kv_proj_name = "residual_qkv_proj" if pic_enabled else "gist_qkv_proj"
+            c2kv_proj = QKVParallelLinear(
                 hidden_size,
                 self.head_dim,
                 self.total_num_heads,
@@ -155,9 +166,22 @@ class Qwen3Attention(nn.Module):
                 quant_config=quant_config,
                 tp_rank=attn_tp_rank,
                 tp_size=attn_tp_size,
-                prefix=add_prefix("gist_qkv_proj", prefix),
+                prefix=add_prefix(c2kv_proj_name, prefix),
             )
-            self.flex_attention = torch.compile(flex_attention, dynamic=True)
+            setattr(self, c2kv_proj_name, c2kv_proj)
+            if pic_enabled:
+                # Loading a base Qwen3 checkpoint with PIC enabled must initially
+                # preserve its QKV projections exactly.
+                with torch.no_grad():
+                    if hasattr(c2kv_proj, "weight"):
+                        c2kv_proj.weight.zero_()
+                    if c2kv_proj.bias is not None:
+                        c2kv_proj.bias.zero_()
+            kernel_options = C2KV_KERNEL_OPTIONS if not pic_enabled else PIC_KERNEL_OPTIONS
+            self.flex_attention = torch.compile(
+                partial(flex_attention, kernel_options=kernel_options), 
+                dynamic=True
+            )
 
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -385,7 +409,6 @@ class Qwen3Attention(nn.Module):
 
         attn_output = self.flex_attention(
             q, k, v, block_mask=attention_mask, scale=self.scaling, enable_gqa=True,
-            kernel_options=C2KV_KERNEL_OPTIONS,
         )
 
         # Reshape back: (1, num_heads, total_len, head_dim) -> (total_len, hidden)
@@ -400,6 +423,58 @@ class Qwen3Attention(nn.Module):
         output = output.unsqueeze(0)   # (1, total_len, hidden_size)
 
         return output, gist_key_values
+
+    def forward_with_pic(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        attention_mask,
+    ):
+        """Encode every document token with residual QKV and retain pre-RoPE K/V."""
+        qkv, _ = self.qkv_proj(hidden_states)
+        residual_qkv, _ = self.residual_qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        residual_q, residual_k, residual_v = residual_qkv.split(
+            [self.q_size, self.kv_size, self.kv_size], dim=-1
+        )
+        if "q" in self.pic_param:
+            q = q + residual_q
+        if "k" in self.pic_param:
+            k = k + residual_k
+        if "v" in self.pic_param:
+            v = v + residual_v
+
+        q, k = apply_qk_norm(
+            q=q, k=k, q_norm=self.q_norm, k_norm=self.k_norm, head_dim=self.head_dim
+        )
+        pic_key_values = (
+            k[0].contiguous().clone(),
+            v[0].contiguous().clone(),
+        )
+
+        seq_len = hidden_states.shape[1]
+        q, k = self.rotary_emb(positions, q.squeeze(0), k.squeeze(0))
+        v = v.squeeze(0)
+        q = q.view(1, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(1, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(1, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        attn_output = self.flex_attention(
+            q,
+            k,
+            v,
+            block_mask=attention_mask,
+            scale=self.scaling,
+            enable_gqa=True,
+        )
+        attn_output = (
+            attn_output.transpose(1, 2)
+            .contiguous()
+            .view(seq_len, self.num_heads * self.head_dim)
+        )
+        output, _ = self.o_proj(attn_output)
+        output = tensor_model_parallel_all_reduce(output).unsqueeze(0)
+        return output, pic_key_values
 
 
 class Qwen3DecoderLayer(nn.Module):
@@ -429,6 +504,8 @@ class Qwen3DecoderLayer(nn.Module):
             quant_config=quant_config,
             rms_norm_eps=config.rms_norm_eps,
             attention_bias=config.attention_bias,
+            pic_enabled=getattr(config, "pic_enabled", False),
+            pic_param=getattr(config, "pic_param", "qkv"),
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
         )
@@ -542,6 +619,26 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         return hidden_states, gist_key_values
 
+    def forward_with_pic(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        attention_mask,
+    ):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, pic_key_values = self.self_attn.forward_with_pic(
+            hidden_states,
+            positions,
+            attention_mask,
+        )
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states, pic_key_values
+
 
 class Qwen3Model(Qwen2Model):
     def __init__(
@@ -635,8 +732,17 @@ class Qwen3ForCausalLM(nn.Module):
 
         _server_args = get_global_server_args()
         self.enable_c2kv = _server_args and _server_args.enable_c2kv
+        self.full_length_pic = self.enable_c2kv and getattr(
+            config, "pic_enabled", False
+        )
         if self.enable_c2kv:
-            self.gist_cfg = self.model._init_c2kv(config, _server_args)
+            if self.full_length_pic:
+                logger.info(
+                    "C2KV is using full-length residual-QKV PIC with storage "
+                    "compression ratio 1."
+                )
+            else:
+                self.gist_cfg = self.model._init_c2kv(config, _server_args)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()
@@ -772,6 +878,28 @@ class Qwen3ForCausalLM(nn.Module):
         gist_position_ids = position_ids[:, -gist_len:].contiguous()
         return gist_key_values, gist_mask, gist_position_ids
 
+    @torch.no_grad()
+    def generate_pic(self, input_ids, attention_mask, ratio=1, **kwargs):
+        """Extract full-length residual-QKV PIC states for one document."""
+        if not self.full_length_pic:
+            raise ValueError("generate_pic requires a checkpoint with pic_enabled=True.")
+        if ratio != 1:
+            raise ValueError("Full-length PIC storage requires compression_ratio=1.")
+
+        block_mask, pic_mask, position_ids = prepare_pic_input(
+            input_ids, attention_mask
+        )
+        hidden_states = self.model.embed_tokens(input_ids)
+        pic_key_values = []
+        for layer in self.model.layers:
+            hidden_states, layer_kv = layer.forward_with_pic(
+                hidden_states,
+                positions=position_ids.squeeze(0),
+                attention_mask=block_mask,
+            )
+            pic_key_values.append(layer_kv)
+        return pic_key_values, pic_mask, position_ids
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -782,11 +910,18 @@ class Qwen3ForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
         if self.enable_c2kv:
-            stacked_params_mapping += [
-                ("gist_qkv_proj", "gist_q_proj", "q"),
-                ("gist_qkv_proj", "gist_k_proj", "k"),
-                ("gist_qkv_proj", "gist_v_proj", "v"),
-            ]
+            if self.full_length_pic:
+                stacked_params_mapping += [
+                    ("residual_qkv_proj", "residual_q_proj", "q"),
+                    ("residual_qkv_proj", "residual_k_proj", "k"),
+                    ("residual_qkv_proj", "residual_v_proj", "v"),
+                ]
+            else:
+                stacked_params_mapping += [
+                    ("gist_qkv_proj", "gist_q_proj", "q"),
+                    ("gist_qkv_proj", "gist_k_proj", "k"),
+                    ("gist_qkv_proj", "gist_v_proj", "v"),
+                ]
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
