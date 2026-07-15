@@ -16,11 +16,6 @@ C2KV_KERNEL_OPTIONS = FlexKernelOptions(
     FORCE_USE_FLEX_ATTENTION=True,
 )
 
-PIC_KERNEL_OPTIONS = FlexKernelOptions(
-    FORCE_USE_FLEX_ATTENTION=True,
-    BACKEND="FLASH",
-)
-
 
 def resolve_c2kv_compression_ratio(
     requested_ratio: int, *, full_length_pic: bool
@@ -32,7 +27,7 @@ def resolve_c2kv_compression_ratio(
 
 
 def prepare_pic_input(input_ids, attention_mask):
-    """Build causal attention metadata for full-length, unpadded PIC extraction."""
+    """Build token and position metadata for full-length PIC extraction."""
     if input_ids.ndim != 2 or input_ids.shape[0] != 1:
         raise ValueError(
             "PIC extraction currently requires input_ids with shape (1, seq_len), "
@@ -50,22 +45,11 @@ def prepare_pic_input(input_ids, attention_mask):
     if seq_len == 0:
         raise ValueError("PIC extraction requires at least one token.")
 
-    def causal_mask(batch_idx, head_idx, q_idx, kv_idx):
-        return q_idx >= kv_idx
-
-    block_mask = create_block_mask(
-        causal_mask,
-        B=1,
-        H=None,
-        Q_LEN=seq_len,
-        KV_LEN=seq_len,
-        device=input_ids.device,
-    )
     pic_mask = torch.ones((1, seq_len), dtype=torch.bool, device=input_ids.device)
     position_ids = torch.arange(
         seq_len, dtype=torch.long, device=input_ids.device
     ).unsqueeze(0)
-    return block_mask, pic_mask, position_ids
+    return pic_mask, position_ids
 
 
 @dataclass

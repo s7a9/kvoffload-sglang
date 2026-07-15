@@ -2352,6 +2352,19 @@ class Scheduler(
         if not rounds:
             return "C2KV request has no real tokens to drive gist injection."
 
+        virtual_len = len(virtual_ids)
+        if virtual_len >= self.max_req_input_len:
+            return (
+                f"C2KV virtual input length ({virtual_len} tokens) exceeds "
+                f"the maximum allowed input length ({self.max_req_input_len} "
+                "tokens) after PIC injection. Use fewer or shorter PIC segments."
+            )
+
+        req.sampling_params.max_new_tokens = min(
+            req.sampling_params.max_new_tokens,
+            self.max_req_len - virtual_len - 1,
+        )
+
         pinned_keys = list(dict.fromkeys(seg.key_hash for seg in segments))
         if not self.c2kv_pool.pin_many(pinned_keys):
             return "C2KV cache miss while pinning segments."
@@ -2366,7 +2379,7 @@ class Scheduler(
             "build_rounds",
             req=req,
             original_len=original_len,
-            virtual_len=len(virtual_ids),
+            virtual_len=virtual_len,
             segment_spans=[
                 (segment.key_hash[:16], segment.token_start, segment.token_end)
                 for segment in segments

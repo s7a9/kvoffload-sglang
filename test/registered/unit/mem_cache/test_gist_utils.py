@@ -3,7 +3,6 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.gist_utils import (
-    PIC_KERNEL_OPTIONS,
     prepare_pic_input,
     resolve_c2kv_compression_ratio,
 )
@@ -13,10 +12,6 @@ register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
 
 
 class TestPICUtils(unittest.TestCase):
-    def test_pic_uses_flash_flex_attention_backend(self):
-        self.assertEqual(PIC_KERNEL_OPTIONS["BACKEND"], "FLASH")
-        self.assertTrue(PIC_KERNEL_OPTIONS["FORCE_USE_FLEX_ATTENTION"])
-
     def test_full_length_pic_forces_ratio_one(self):
         self.assertEqual(
             resolve_c2kv_compression_ratio(4, full_length_pic=True), 1
@@ -31,11 +26,10 @@ class TestPICUtils(unittest.TestCase):
 
     def test_pic_metadata_retains_every_token(self):
         input_ids = torch.tensor([[1, 2, 3, 4]])
-        block_mask, pic_mask, position_ids = prepare_pic_input(
+        pic_mask, position_ids = prepare_pic_input(
             input_ids, torch.ones_like(input_ids, dtype=torch.bool)
         )
 
-        self.assertEqual(block_mask.shape, (1, 1, 4, 4))
         torch.testing.assert_close(pic_mask, torch.ones_like(pic_mask))
         torch.testing.assert_close(position_ids, torch.tensor([[0, 1, 2, 3]]))
 

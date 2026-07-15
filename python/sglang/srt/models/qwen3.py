@@ -1,7 +1,7 @@
 # Adapted from qwen2.py
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Tuple
 from functools import partial
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -28,7 +28,6 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.mem_cache.gist_utils import (
     C2KV_KERNEL_OPTIONS,
     GistConfig,
-    PIC_KERNEL_OPTIONS,
     get_apply_gist_residual_func,
     get_prepare_gist_input_func,
     prepare_pic_input,
@@ -177,11 +176,21 @@ class Qwen3Attention(nn.Module):
                         c2kv_proj.weight.zero_()
                     if c2kv_proj.bias is not None:
                         c2kv_proj.bias.zero_()
-            kernel_options = C2KV_KERNEL_OPTIONS if not pic_enabled else PIC_KERNEL_OPTIONS
-            self.flex_attention = torch.compile(
-                partial(flex_attention, kernel_options=kernel_options), 
-                dynamic=True
-            )
+            if pic_enabled:
+                try:
+                    from flash_attn import flash_attn_func
+                except ImportError as e:
+                    raise ImportError(
+                        "Full-length PIC extraction requires FlashAttention 2."
+                    ) from e
+                self.flash_attention_2 = flash_attn_func
+            else:
+                self.flex_attention = torch.compile(
+                    partial(
+                        flex_attention, kernel_options=C2KV_KERNEL_OPTIONS
+                    ),
+                    dynamic=True,
+                )
 
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -428,7 +437,6 @@ class Qwen3Attention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
-        attention_mask,
     ):
         """Encode every document token with residual QKV and retain pre-RoPE K/V."""
         qkv, _ = self.qkv_proj(hidden_states)
@@ -455,22 +463,20 @@ class Qwen3Attention(nn.Module):
         seq_len = hidden_states.shape[1]
         q, k = self.rotary_emb(positions, q.squeeze(0), k.squeeze(0))
         v = v.squeeze(0)
-        q = q.view(1, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(1, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(1, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = q.view(1, seq_len, self.num_heads, self.head_dim).contiguous()
+        k = k.view(1, seq_len, self.num_kv_heads, self.head_dim).contiguous()
+        v = v.view(1, seq_len, self.num_kv_heads, self.head_dim).contiguous()
 
-        attn_output = self.flex_attention(
+        attn_output = self.flash_attention_2(
             q,
             k,
             v,
-            block_mask=attention_mask,
-            scale=self.scaling,
-            enable_gqa=True,
+            dropout_p=0.0,
+            softmax_scale=self.scaling,
+            causal=True,
         )
-        attn_output = (
-            attn_output.transpose(1, 2)
-            .contiguous()
-            .view(seq_len, self.num_heads * self.head_dim)
+        attn_output = attn_output.reshape(
+            seq_len, self.num_heads * self.head_dim
         )
         output, _ = self.o_proj(attn_output)
         output = tensor_model_parallel_all_reduce(output).unsqueeze(0)
@@ -623,14 +629,12 @@ class Qwen3DecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
-        attention_mask,
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states, pic_key_values = self.self_attn.forward_with_pic(
             hidden_states,
             positions,
-            attention_mask,
         )
         hidden_states = residual + hidden_states
         residual = hidden_states
@@ -886,16 +890,13 @@ class Qwen3ForCausalLM(nn.Module):
         if ratio != 1:
             raise ValueError("Full-length PIC storage requires compression_ratio=1.")
 
-        block_mask, pic_mask, position_ids = prepare_pic_input(
-            input_ids, attention_mask
-        )
+        pic_mask, position_ids = prepare_pic_input(input_ids, attention_mask)
         hidden_states = self.model.embed_tokens(input_ids)
         pic_key_values = []
         for layer in self.model.layers:
             hidden_states, layer_kv = layer.forward_with_pic(
                 hidden_states,
                 positions=position_ids.squeeze(0),
-                attention_mask=block_mask,
             )
             pic_key_values.append(layer_kv)
         return pic_key_values, pic_mask, position_ids
