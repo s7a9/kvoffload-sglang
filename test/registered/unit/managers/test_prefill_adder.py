@@ -1,8 +1,8 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
@@ -65,6 +65,10 @@ class TestPrefillAdder(CustomTestCase):
         server_args.schedule_low_priority_values_first = (
             schedule_low_priority_values_first
         )
+        server_args.kv_offload_enable_emergency_eviction = False
+        server_args.kv_offload_emergency_min_evict_tokens = 256
+        server_args.kv_offload_emergency_prefill_retry = 1
+        server_args.kv_offload_emergency_trigger_ratio = 0.05
         return server_args
 
     def create_mock_req(
@@ -86,8 +90,121 @@ class TestPrefillAdder(CustomTestCase):
             max_new_tokens=max_new_tokens, ignore_eos=ignore_eos
         )
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
+        req.kv_committed_len = 0
+        req.is_retracted = False
         req.finished.return_value = False
         return req
+
+    def test_pressure_offload_selects_longest_running_request(self):
+        shorter = self.create_mock_req(
+            "shorter", priority=0, max_new_tokens=100, output_len=20
+        )
+        shorter.kv_committed_len = 500
+        longer = self.create_mock_req(
+            "longer", priority=0, max_new_tokens=100, output_len=50
+        )
+        longer.kv_committed_len = 400
+        running_batch = self.create_running_batch([shorter, longer])
+        self.mock_tree_cache.supports_request_offload = True
+        self.mock_token_allocator.size = 1000
+        self.mock_token_allocator.available_size.return_value = 500
+        adder = self.create_adder(running_batch)
+
+        server_args = self.create_server_args(
+            schedule_low_priority_values_first=False
+        )
+        server_args.kv_offload_enable_emergency_eviction = True
+        server_args.kv_offload_emergency_trigger_ratio = 0.1
+        incoming = self.create_mock_req(
+            "incoming", priority=0, max_new_tokens=400
+        )
+
+        self.assertTrue(
+            adder.offload_long_running_to_schedule(incoming, server_args)
+        )
+        running_batch.release_req.assert_called_once_with(1, 1, server_args)
+        running_batch.filter_batch.assert_called_once_with(keep_indices=[0])
+        self.assertEqual(adder.preempt_list, [longer])
+        self.assertEqual(adder.emergency_offload_count, 1)
+
+    def test_pressure_offload_rejects_large_admission_deficit(self):
+        running = self.create_mock_req(
+            "running", priority=0, max_new_tokens=100, output_len=50
+        )
+        running.kv_committed_len = 500
+        running_batch = self.create_running_batch([running])
+        self.mock_tree_cache.supports_request_offload = True
+        self.mock_token_allocator.size = 1000
+        self.mock_token_allocator.available_size.return_value = 100
+        adder = self.create_adder(running_batch)
+
+        server_args = self.create_server_args(
+            schedule_low_priority_values_first=False
+        )
+        server_args.kv_offload_enable_emergency_eviction = True
+        server_args.kv_offload_emergency_trigger_ratio = 0.1
+        incoming = self.create_mock_req(
+            "incoming", priority=0, max_new_tokens=400
+        )
+
+        self.assertFalse(
+            adder.offload_long_running_to_schedule(incoming, server_args)
+        )
+        running_batch.release_req.assert_not_called()
+
+    def test_pressure_offload_does_not_swap_retracted_request(self):
+        running = self.create_mock_req(
+            "running", priority=0, max_new_tokens=100, output_len=50
+        )
+        running.kv_committed_len = 500
+        running_batch = self.create_running_batch([running])
+        self.mock_tree_cache.supports_request_offload = True
+        self.mock_token_allocator.size = 1000
+        self.mock_token_allocator.available_size.return_value = 500
+        adder = self.create_adder(running_batch)
+
+        server_args = self.create_server_args(
+            schedule_low_priority_values_first=False
+        )
+        server_args.kv_offload_enable_emergency_eviction = True
+        server_args.kv_offload_emergency_trigger_ratio = 0.1
+        incoming = self.create_mock_req(
+            "retracted", priority=0, max_new_tokens=500
+        )
+        incoming.is_retracted = True
+
+        self.assertFalse(
+            adder.offload_long_running_to_schedule(incoming, server_args)
+        )
+        running_batch.release_req.assert_not_called()
+
+    def test_release_req_uses_request_offload_without_double_free(self):
+        req = self.create_mock_req(
+            "running", priority=0, max_new_tokens=100, output_len=50
+        )
+        tree_cache = MagicMock()
+        tree_cache.supports_request_offload = True
+        batch = SimpleNamespace(
+            reqs=[req],
+            tree_cache=tree_cache,
+            req_to_token_pool=MagicMock(),
+            token_to_kv_pool_allocator=MagicMock(),
+        )
+        server_args = self.create_server_args(
+            schedule_low_priority_values_first=False
+        )
+
+        with (
+            patch(
+                "sglang.srt.managers.schedule_batch.release_kv_cache"
+            ) as release_kv_cache_mock,
+            patch("sglang.srt.managers.schedule_batch.evict_from_tree_cache"),
+        ):
+            ScheduleBatch.release_req(batch, 0, 0, server_args)
+
+        tree_cache.evict_device.assert_called_once_with(req)
+        release_kv_cache_mock.assert_not_called()
+        req.reset_for_retract.assert_called_once_with()
 
     def create_adder(self, running_batch, **kwargs):
         defaults = dict(

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import dataclasses
-import logging
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache, TreeNode
@@ -13,109 +12,65 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 
-logger = logging.getLogger(__name__)
-
-
 @dataclasses.dataclass
 class SyncCacheReqState:
     rid: str
     synced_len: int = 0
-    decode_since_last_sync: int = 0
 
 
 class SyncCache(HiRadixCache):
-    """HiRadix-based sync cache with periodic decode-time synchronization.
+    """HiRadix cache that preserves a request only when it is preempted.
 
-    This mode reuses HiRadixCache offload/load-back implementation while forcing
-    write-through behavior and triggering incremental radix synchronization during
-    decode to avoid waiting until request completion.
+    Running requests stay exclusively on the device. On memory-pressure
+    preemption, their committed KV is inserted into the radix tree, written to
+    host memory, and then removed from the device before the request is queued
+    again.
     """
 
+    supports_request_offload = True
+
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
-        # Sync cache must maintain radix nodes even if disable_radix_cache is set.
-        # It also uses write-through without storage backend.
+        # Request offload needs radix metadata even when the regular radix cache
+        # was disabled. Write-back avoids copying active requests continuously.
         sync_params = dataclasses.replace(params, disable=False)
         sync_server_args = dataclasses.replace(
             server_args,
-            hicache_write_policy="write_through",
+            hicache_write_policy="write_back",
             hicache_storage_backend=None,
         )
         self._req_states: Dict[str, SyncCacheReqState] = {}
 
-        # Keep the knobs close to the old SyncCache behavior.
-        self.prefill_sync_chunk_size = max(1, int(sync_params.chunked_prefill_size or 2048))
-        self.decode_sync_stride_steps = 512
-        self.decode_sync_min_tokens = max(512, sync_params.page_size)
-
         super().__init__(params=sync_params, server_args=sync_server_args)
 
     def _infer_seq_len(self, req: Req) -> int:
-        fill_ids = getattr(req, "fill_ids", None)
-        if fill_ids is not None and len(fill_ids) > 0:
-            return len(fill_ids)
+        committed_len = int(getattr(req, "kv_committed_len", 0))
+        if committed_len > 0:
+            return committed_len
         return max(len(req.origin_input_ids) + len(req.output_ids) - 1, 0)
 
     def _ensure_fill_ids(self, req: Req, seq_len: int) -> None:
-        fill_ids = getattr(req, "fill_ids", None)
-        if fill_ids is None or len(fill_ids) != seq_len:
-            req.fill_ids = req.origin_input_ids + req.output_ids
+        token_ids = req.origin_input_ids + req.output_ids
+        # EAGLE radix keys are bigrams, so N committed KV entries require
+        # N + 1 token ids. Regular radix keys require exactly N token ids.
+        fill_len = seq_len + 1 if self.is_eagle else seq_len
+        req.fill_ids = token_ids[:fill_len]
 
-    def _sync_req_to_radix(
-        self,
-        req: Req,
-        seq_len: int,
-        *,
-        force: bool,
-        is_decode: bool,
-        chunked: bool,
-    ) -> None:
+    def _sync_req_to_radix(self, req: Req, seq_len: int) -> None:
         if req.req_pool_idx is None or seq_len <= 0:
             return
 
         state = self._req_states.setdefault(req.rid, SyncCacheReqState(rid=req.rid))
-        unsynced_len = seq_len - state.synced_len
-        if unsynced_len <= 0:
-            return
-
-        if is_decode and not force:
-            state.decode_since_last_sync += 1
-            if (
-                state.decode_since_last_sync < self.decode_sync_stride_steps
-                and unsynced_len < self.decode_sync_min_tokens
-            ):
-                return
-
-        # For long prefill in sync mode, avoid very tiny synchronization steps.
-        if (not is_decode) and (not force) and unsynced_len < self.prefill_sync_chunk_size:
+        if seq_len <= state.synced_len:
             return
 
         self._ensure_fill_ids(req, seq_len)
-        super().cache_unfinished_req(req, chunked=chunked)
+        super().cache_unfinished_req(req, chunked=False)
         state.synced_len = seq_len
-        state.decode_since_last_sync = 0
 
     def sync_batch(self, batch: ScheduleBatch) -> None:
-        self.flush_write_through_acks()
-        is_extend = batch.forward_mode.is_extend()
-
-        for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
-            seq_len = int(seq_len)
-            if is_extend:
-                self._sync_req_to_radix(
-                    req,
-                    seq_len,
-                    force=False,
-                    is_decode=False,
-                    chunked=getattr(req, "is_chunked", 0) > 0,
-                )
-            else:
-                self._sync_req_to_radix(
-                    req,
-                    seq_len,
-                    force=False,
-                    is_decode=True,
-                    chunked=False,
-                )
+        # Deliberately do no per-step synchronization. The full committed
+        # request is synchronized once in evict_device when pressure requires it.
+        return
 
     def _collect_req_path_nodes(self, req: Req) -> List[TreeNode]:
         nodes: List[TreeNode] = []
@@ -124,12 +79,6 @@ class SyncCache(HiRadixCache):
             nodes.append(node)
             node = node.parent
         return nodes
-
-    def _req_has_ongoing_write(self, req: Req) -> bool:
-        for node in self._collect_req_path_nodes(req):
-            if node.id in self.ongoing_write_through:
-                return True
-        return False
 
     def _free_unprotected_tail(self, req: Req, target_len: int) -> None:
         if req.req_pool_idx is None or target_len <= 0:
@@ -148,24 +97,17 @@ class SyncCache(HiRadixCache):
             return
 
         inferred_seq_len = self._infer_seq_len(req)
-        target_len = min(seq_len, inferred_seq_len) if seq_len is not None else inferred_seq_len
+        target_len = (
+            min(seq_len, inferred_seq_len)
+            if seq_len is not None
+            else inferred_seq_len
+        )
         if target_len <= 0:
             self._req_states.pop(req.rid, None)
             return
 
-        # Ensure latest KV is represented in radix before offloading.
-        self._sync_req_to_radix(
-            req,
-            inferred_seq_len,
-            force=True,
-            is_decode=False,
-            chunked=False,
-        )
-        self.flush_write_through_acks()
-
-        # If this request is still being written, block until write-through ack arrives.
-        if self._req_has_ongoing_write(req):
-            self.writing_check(write_back=True)
+        # Ensure the latest committed KV is represented in radix before offloading.
+        self._sync_req_to_radix(req, target_len)
 
         path_nodes = self._collect_req_path_nodes(req)
 
@@ -191,8 +133,11 @@ class SyncCache(HiRadixCache):
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
 
-        # Free non-radix-protected tail slots.
-        self._free_unprotected_tail(req, target_len)
+        # Free the unaligned committed tail and speculative over-allocation.
+        allocated_len = max(
+            int(getattr(req, "kv_allocated_len", target_len)), target_len
+        )
+        self._free_unprotected_tail(req, allocated_len)
 
         self._req_states.pop(req.rid, None)
 

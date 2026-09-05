@@ -3443,6 +3443,23 @@ class ServerArgs:
                 "--kv-offload-buffer-conservativeness must be a positive finite float."
             )
 
+        if self.kv_offload_emergency_min_evict_tokens <= 0:
+            raise ValueError(
+                "--kv-offload-emergency-min-evict-tokens must be positive."
+            )
+        if self.kv_offload_emergency_decode_retry < 0:
+            raise ValueError(
+                "--kv-offload-emergency-decode-retry must be non-negative."
+            )
+        if self.kv_offload_emergency_prefill_retry < 0:
+            raise ValueError(
+                "--kv-offload-emergency-prefill-retry must be non-negative."
+            )
+        if not (0 < self.kv_offload_emergency_trigger_ratio <= 1):
+            raise ValueError(
+                "--kv-offload-emergency-trigger-ratio must be in range (0, 1]."
+            )
+
         if self.kv_offload_policy != "default" and self.disaggregation_mode != "null":
             raise ValueError(
                 "--kv-offload-policy=paper_v1 is not compatible with PD disaggregation "
@@ -3452,7 +3469,8 @@ class ServerArgs:
         logger.info(
             "Effective KV offload policy config: "
             "policy=%s, reschedule_interval=%d, alpha=%s, beta=%s, gamma=%s, delta=%s, "
-            "default_output_speed=%s, buffer_conservativeness=%s, local_search=%s",
+            "default_output_speed=%s, buffer_conservativeness=%s, local_search=%s, "
+            "emergency_eviction=%s, emergency_trigger_ratio=%s",
             self.kv_offload_policy,
             self.kv_offload_reschedule_interval,
             self.kv_offload_token_value_alpha,
@@ -3462,6 +3480,8 @@ class ServerArgs:
             self.kv_offload_default_output_speed,
             self.kv_offload_buffer_conservativeness,
             self.kv_offload_enable_local_search,
+            self.kv_offload_enable_emergency_eviction,
+            self.kv_offload_emergency_trigger_ratio,
         )
 
     def _handle_deterministic_inference(self):

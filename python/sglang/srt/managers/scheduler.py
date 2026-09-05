@@ -2673,6 +2673,16 @@ class Scheduler(
                 truncation_align_size=self.truncation_align_size,
             )
 
+            if res == AddReqResult.NO_TOKEN and adder.offload_long_running_to_schedule(
+                req, self.server_args
+            ):
+                req.init_next_round_input(self.tree_cache)
+                res = adder.add_one_req(
+                    req,
+                    has_chunked_req=(self.chunked_req is not None),
+                    truncation_align_size=self.truncation_align_size,
+                )
+
             if self.enable_lora:
                 running_loras.add(req.lora_id)
 
@@ -2697,6 +2707,8 @@ class Scheduler(
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            for req in adder.preempt_list:
+                self._add_request_to_queue(req, is_retracted=True)
             return None
 
         can_run_set = set(can_run_list)

@@ -25,7 +25,6 @@ logger = logging.getLogger(__name__)
 """Request scheduler policy"""
 
 import os
-import json
 import random
 from collections import Counter, defaultdict
 from contextlib import contextmanager
@@ -193,11 +192,6 @@ class PaperV1OffloadReschedulePolicy(OffloadReschedulePolicy):
         if self.enable_local_search:
             refined_order = self._local_search(refined_order, candidate_map)
         objective_after_local_search = self._evaluate_order(refined_order, candidate_map)
-
-        with open('candidate_map.jsonl', 'a') as f:
-            candidate_map_serialized = {f"{k[0]}_{k[1]}": {"objective": v["objective"]} | v["terms"] for k, v in candidate_map.items()}
-            json.dump(candidate_map_serialized, f)
-            f.write('\n')
 
         resume_list, _ = (
             self._materialize_decision_order(refined_order, snapshot)
@@ -794,6 +788,7 @@ class PrefillAdder:
         self.req_states = None
         self.can_run_list = []
         self.preempt_list = []
+        self.emergency_offload_count = 0
         self.new_chunked_req = None
         self.log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
@@ -1301,4 +1296,91 @@ class PrefillAdder:
                 keep_indices.append(i)
         self.running_batch.filter_batch(keep_indices=keep_indices)
         self.preempt_list.extend(preemptible_reqs)
+        return True
+
+    def offload_long_running_to_schedule(
+        self, req: Req, server_args: ServerArgs
+    ) -> bool:
+        """Offload one mature running request for a small admission deficit."""
+        if not server_args.kv_offload_enable_emergency_eviction:
+            return False
+        # A previously offloaded request must wait for natural capacity. Letting
+        # it evict another running request would create swap ping-pong.
+        if getattr(req, "is_retracted", False):
+            return False
+        if getattr(self.tree_cache, "supports_request_offload", False) is not True:
+            return False
+        if self.emergency_offload_count >= max(
+            int(server_args.kv_offload_emergency_prefill_retry), 0
+        ):
+            return False
+
+        required_tokens = (
+            req.extend_input_len
+            + self._get_request_max_new_tokens_for_estimation(req)
+        )
+        deficit = max(required_tokens - int(self.rem_total_tokens) + 1, 0)
+        if deficit <= 0:
+            return False
+
+        pool_size = max(int(self.token_to_kv_pool_allocator.size), 1)
+        max_small_deficit = max(
+            int(server_args.kv_offload_emergency_min_evict_tokens),
+            int(pool_size * server_args.kv_offload_emergency_trigger_ratio),
+        )
+        if deficit > max_small_deficit:
+            return False
+
+        candidates = []
+        for index, running_req in enumerate(self.running_batch.reqs):
+            if running_req in self.preempt_list or running_req.finished():
+                continue
+
+            committed_len = int(getattr(running_req, "kv_committed_len", 0))
+            if committed_len < server_args.kv_offload_emergency_min_evict_tokens:
+                continue
+
+            reclaimable = committed_len + self._get_running_request_total_token_offset(
+                running_req
+            )
+            if reclaimable < deficit:
+                continue
+
+            candidates.append(
+                (
+                    len(running_req.output_ids),
+                    committed_len,
+                    running_req.rid,
+                    index,
+                    running_req,
+                )
+            )
+
+        if not candidates:
+            return False
+
+        # Decode progress is deterministic across TP ranks and is a stable proxy
+        # for runtime. Prefer the request that has already run the longest.
+        _, _, _, victim_index, victim = max(candidates)
+        logger.info(
+            "KV offload admission: waiting_rid=%s deficit=%d victim_rid=%s "
+            "victim_committed=%d victim_output=%d",
+            req.rid,
+            deficit,
+            victim.rid,
+            int(getattr(victim, "kv_committed_len", 0)),
+            len(victim.output_ids),
+        )
+        self.rem_total_token_offset -= self._get_running_request_total_token_offset(
+            victim
+        )
+        self.running_batch.release_req(
+            victim_index, len(self.running_batch.reqs) - 1, server_args
+        )
+        keep_indices = [
+            i for i in range(len(self.running_batch.reqs)) if i != victim_index
+        ]
+        self.running_batch.filter_batch(keep_indices=keep_indices)
+        self.preempt_list.append(victim)
+        self.emergency_offload_count += 1
         return True
