@@ -36,6 +36,7 @@ from sglang.srt.configs.model_config import (
     compute_mla_mscale_scaling,
     get_nsa_index_head_dim,
     get_nsa_index_n_heads,
+    get_nsa_indexshare_flags,
     get_nsa_index_topk,
     is_deepseek_nsa,
 )
@@ -1098,6 +1099,7 @@ class DeepseekV2AttentionMLA(
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
         skip_rope: bool = False,
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -1109,6 +1111,7 @@ class DeepseekV2AttentionMLA(
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.quant_config = quant_config
+        self.is_nextn = is_nextn
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
         self.use_nsa = is_deepseek_nsa(config)
@@ -1168,6 +1171,15 @@ class DeepseekV2AttentionMLA(
             )
 
         if self.use_nsa:
+            self.index_topk_freq = getattr(config, "index_topk_freq", 1)
+            self.index_topk_pattern = getattr(config, "index_topk_pattern", None)
+            self.index_skip_topk_offset = getattr(
+                config, "index_skip_topk_offset", None
+            )
+            self.skip_topk, self.next_skip_topk = get_nsa_indexshare_flags(
+                config, layer_id, is_nextn
+            )
+
             is_neox_style = not getattr(config, "indexer_rope_interleave", False)
             self.indexer = Indexer(
                 hidden_size=hidden_size,
@@ -1549,6 +1561,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             reduce_results=False,
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
+            is_nextn=is_nextn,
         )
         if not hasattr(config, "q_lora_rank") and envs.SGLANG_USE_AG_AFTER_QLORA.get():
             raise ValueError(
@@ -1801,6 +1814,7 @@ class DeepseekV2Model(nn.Module):
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
+        self.use_nsa = is_deepseek_nsa(config)
         self.pp_group = get_pp_group()
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
@@ -1929,6 +1943,9 @@ class DeepseekV2Model(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        if self.use_nsa and not forward_batch.reuse_mtp_topk_indices:
+            forward_batch.topk_indices = None
+
         total_num_layers = self.end_layer - self.start_layer
         if self.pp_group.is_first_rank:
             if input_embeds is None:

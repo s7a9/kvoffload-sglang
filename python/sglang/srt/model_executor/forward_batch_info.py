@@ -396,6 +396,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
     spec_algorithm: SpeculativeAlgorithm = None
+    # DSA IndexShare state. Target forwards reset topk_indices at layer 0;
+    # GLM-5.2 MTP may retain it across draft iterations when explicitly enabled.
+    topk_indices: Optional[torch.Tensor] = None
+    reuse_mtp_topk_indices: bool = False
     mm_input_embeds: Optional[torch.Tensor] = None
     capture_hidden_mode: CaptureHiddenMode = None
 

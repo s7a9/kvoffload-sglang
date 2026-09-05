@@ -86,7 +86,9 @@ def save_request_outputs(outputs: List["RequestFuncOutput"], output_path: str) -
     path = Path(output_path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temp_path = path.with_name(
+        f".{path.stem}.{uuid.uuid4().hex}.tmp{path.suffix}"
+    )
     try:
         _serialize_request_outputs(temp_path, outputs)
         os.replace(temp_path, path)

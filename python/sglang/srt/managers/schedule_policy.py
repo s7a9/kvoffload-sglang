@@ -829,13 +829,21 @@ class PrefillAdder:
         self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
-        return (
-            min(
-                (req.sampling_params.max_new_tokens - len(req.output_ids)),
-                CLIP_MAX_NEW_TOKENS,
-            )
-            * self.new_token_ratio
+        remaining = max(
+            req.sampling_params.max_new_tokens - len(req.output_ids), 0
         )
+        if getattr(req.sampling_params, "ignore_eos", False):
+            return remaining
+        return min(remaining, CLIP_MAX_NEW_TOKENS) * self.new_token_ratio
+
+    @staticmethod
+    def _get_request_max_new_tokens_for_estimation(req: Req) -> int:
+        remaining = max(
+            req.sampling_params.max_new_tokens - len(req.output_ids), 0
+        )
+        if getattr(req.sampling_params, "ignore_eos", False):
+            return remaining
+        return min(remaining, CLIP_MAX_NEW_TOKENS)
 
     @property
     def rem_total_tokens(self):
@@ -967,7 +975,7 @@ class PrefillAdder:
 
         # Update budget: reserve max_new_tokens only if not truncated
         max_new_tokens = (
-            min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            self._get_request_max_new_tokens_for_estimation(req)
             if not truncated
             else 0
         )
@@ -998,7 +1006,7 @@ class PrefillAdder:
             0,
             req.extend_input_len,
             (
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                self._get_request_max_new_tokens_for_estimation(req)
                 if not truncated
                 else 0
             ),
@@ -1135,10 +1143,10 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
-        total_tokens = req.extend_input_len + min(
-            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
+        estimated_max_new_tokens = (
+            self._get_request_max_new_tokens_for_estimation(req)
         )
+        total_tokens = req.extend_input_len + estimated_max_new_tokens
 
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = req.extend_input_len - req.host_hit_length
@@ -1192,10 +1200,7 @@ class PrefillAdder:
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
-                    min(
-                        req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKENS,
-                    ),
+                    estimated_max_new_tokens,
                 )
             else:
                 # Make sure at least one page is available
@@ -1258,7 +1263,7 @@ class PrefillAdder:
         preemptible_reqs = []
         min_tokens_to_remove = (
             req.extend_input_len
-            + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            + self._get_request_max_new_tokens_for_estimation(req)
             - self.rem_total_tokens
         )
         for running_req in sorted_valid_running_reqs:

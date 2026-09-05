@@ -649,49 +649,63 @@ class EAGLEWorker(TpModelWorker):
 
         # Forward multiple steps
         scores = None
-        for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
+        reuse_mtp_topk_indices = (
+            getattr(
+                self.model_config.hf_config,
+                "index_share_for_mtp_iteration",
+                False,
             )
-            score_list.append(tree_info[0])
-            token_list.append(tree_info[1])
-            parents_list.append(tree_info[2])
+            and self.topk == 1
+        )
+        if reuse_mtp_topk_indices:
+            forward_batch.reuse_mtp_topk_indices = True
+            forward_batch.topk_indices = None
+        try:
+            for i in range(self.speculative_num_steps):
+                input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                    i, topk_p, topk_index, hidden_states, scores, self.topk
+                )
+                score_list.append(tree_info[0])
+                token_list.append(tree_info[1])
+                parents_list.append(tree_info[2])
 
-            # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
-            if i == self.speculative_num_steps - 1:
-                break
+                # The draft prefill supplies one token, so the final iteration does not run the model.
+                if i == self.speculative_num_steps - 1:
+                    break
 
-            # Set inputs
-            forward_batch.input_ids = input_ids
-            # This is a temporary fix for the case that the user is using standalone
-            # speculative decoding and the draft model architecture is gpt-oss. gpt-oss
-            # rope kernel needs cache_loc to be contiguous.
-            if (
-                self.server_args.speculative_algorithm == "STANDALONE"
-                and self.model_config.hf_config.architectures[0] == "GptOssForCausalLM"
-            ):
-                out_cache_loc = out_cache_loc.contiguous()
-            forward_batch.out_cache_loc = out_cache_loc[i]
-            forward_batch.positions.add_(1)
-            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
-            spec_info.hidden_states = hidden_states
+                forward_batch.input_ids = input_ids
+                if (
+                    self.server_args.speculative_algorithm == "STANDALONE"
+                    and self.model_config.hf_config.architectures[0]
+                    == "GptOssForCausalLM"
+                ):
+                    out_cache_loc = out_cache_loc.contiguous()
+                forward_batch.out_cache_loc = out_cache_loc[i]
+                forward_batch.positions.add_(1)
+                forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+                spec_info.hidden_states = hidden_states
 
-            # Run forward
-            logits_output = self.draft_model_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            ).logits_output
-            maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            maybe_detect_oob(
-                topk_index,
-                0,
-                logits_output.next_token_logits.shape[-1],
-                f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
-            )
-            if self.hot_token_id is not None:
-                topk_index = self.hot_token_id[topk_index]
-            hidden_states = logits_output.hidden_states
+                logits_output = self.draft_model_runner.forward(
+                    forward_batch, skip_attn_backend_init=True
+                ).logits_output
+                maybe_detect_nan(
+                    logits_output.next_token_logits, f"draft_forward step {i}"
+                )
+                probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+                maybe_detect_oob(
+                    topk_index,
+                    0,
+                    logits_output.next_token_logits.shape[-1],
+                    f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+                )
+                if self.hot_token_id is not None:
+                    topk_index = self.hot_token_id[topk_index]
+                hidden_states = logits_output.hidden_states
+        finally:
+            if reuse_mtp_topk_indices:
+                forward_batch.topk_indices = None
+                forward_batch.reuse_mtp_topk_indices = False
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens

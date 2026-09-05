@@ -7,20 +7,25 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 BACKEND="${BACKEND:-sglang}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-30000}"
-MODEL="${MODEL:-/storage/nas/dch/models/Qwen--Qwen3-4B-Instruct-2507}"
+MODEL="${MODEL:-/data1/models/GLM-5.2-FP8}"
 
 DATASET_NAME="${DATASET_NAME:-random}"
+DATASET_PATH="${DATASET_PATH:-}"
 NUM_PROMPTS="${NUM_PROMPTS:-200}"
 REQUEST_RATE="${REQUEST_RATE:-inf}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-200}"
 RANDOM_INPUT_LEN="${RANDOM_INPUT_LEN:-512}"
 RANDOM_OUTPUT_LEN="${RANDOM_OUTPUT_LEN:-2048}"
 RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO:-0.2}"
+SEED="${SEED:-1}"
+WARMUP_REQUESTS="${WARMUP_REQUESTS:-1}"
 OUTPUT_SPEED="${OUTPUT_SPEED:-}"
 
-OUTPUT_FILE="${OUTPUT_FILE:-kvoffload/bench_results.jsonl}"
-REQUEST_OUTPUTS_FILE="${REQUEST_OUTPUTS_FILE:-request_outputs.jsonl}"
-TAG="${TAG:-}"
+RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
+TAG="${TAG:-${RUN_ID}}"
+RESULT_DIR="${RESULT_DIR:-kvoffload/results/${RUN_ID}}"
+OUTPUT_FILE="${OUTPUT_FILE:-${RESULT_DIR}/bench_results.jsonl}"
+REQUEST_OUTPUTS_FILE="${REQUEST_OUTPUTS_FILE:-${RESULT_DIR}/${TAG}_request_outputs.jsonl}"
 
 EXTRA_CLI_ARGS=()
 while (($#)); do
@@ -45,6 +50,7 @@ while (($#)); do
 done
 
 cd "${REPO_ROOT}"
+mkdir -p "$(dirname "${OUTPUT_FILE}")" "$(dirname "${REQUEST_OUTPUTS_FILE}")"
 
 CMD=(
   python3 -m sglang.bench_serving
@@ -53,18 +59,23 @@ CMD=(
   --port "${PORT}"
   --model "${MODEL}"
   --dataset-name "${DATASET_NAME}"
-  --dataset-path "https://hf-mirror.com/datasets/learnanything/sharegpt_v3_unfiltered_cleaned_split/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
   --num-prompts "${NUM_PROMPTS}"
   --request-rate "${REQUEST_RATE}"
   --max-concurrency "${MAX_CONCURRENCY}"
   --random-input-len "${RANDOM_INPUT_LEN}"
   --random-output-len "${RANDOM_OUTPUT_LEN}"
   --random-range-ratio "${RANDOM_RANGE_RATIO}"
+  --seed "${SEED}"
+  --warmup-requests "${WARMUP_REQUESTS}"
   --output-file "${OUTPUT_FILE}"
   --output-details
   --save-request-outputs
   --request-outputs-file "${REQUEST_OUTPUTS_FILE}"
 )
+
+if [[ -n "${DATASET_PATH}" ]]; then
+  CMD+=(--dataset-path "${DATASET_PATH}")
+fi
 
 if [[ -n "${OUTPUT_SPEED}" ]]; then
   CMD+=(--output-speed "${OUTPUT_SPEED}")

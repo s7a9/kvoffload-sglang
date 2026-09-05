@@ -67,14 +67,24 @@ class TestPrefillAdder(CustomTestCase):
         )
         return server_args
 
-    def create_mock_req(self, rid, priority, max_new_tokens, output_len=0, wait_time=0):
+    def create_mock_req(
+        self,
+        rid,
+        priority,
+        max_new_tokens,
+        output_len=0,
+        wait_time=0,
+        ignore_eos=False,
+    ):
         req = MagicMock(spec=Req)
         req.rid = str(rid)
         req.priority = priority
         req.extend_input_len = 0
         req.extend_logprob_start_len = 0
         req.output_ids = [0] * output_len
-        req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
+        req.sampling_params = SimpleNamespace(
+            max_new_tokens=max_new_tokens, ignore_eos=ignore_eos
+        )
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.finished.return_value = False
         return req
@@ -93,6 +103,22 @@ class TestPrefillAdder(CustomTestCase):
         )
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
+
+    def test_ignore_eos_running_reservation_is_not_clipped(self):
+        req = self.create_mock_req(
+            "run", priority=0, max_new_tokens=16384, ignore_eos=True
+        )
+        adder = self.create_adder(self.create_running_batch([req]))
+
+        self.assertEqual(adder.rem_total_token_offset, 16384)
+
+    def test_regular_running_reservation_remains_clipped(self):
+        req = self.create_mock_req(
+            "run", priority=0, max_new_tokens=16384, ignore_eos=False
+        )
+        adder = self.create_adder(self.create_running_batch([req]))
+
+        self.assertEqual(adder.rem_total_token_offset, 4096)
 
     def test_preempt_success_high_priority_values_first(self):
         params = [

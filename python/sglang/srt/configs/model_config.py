@@ -92,6 +92,34 @@ def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     return config.index_n_heads
 
 
+def get_nsa_indexshare_flags(
+    config: PretrainedConfig, layer_id: int, is_nextn: bool = False
+) -> tuple[bool, bool]:
+    """Return whether this and the next DSA layer reuse a prior top-k result."""
+    if is_nextn:
+        return True, True
+
+    frequency = getattr(config, "index_topk_freq", 1)
+    pattern = getattr(config, "index_topk_pattern", None)
+    offset = getattr(config, "index_skip_topk_offset", None)
+    if frequency <= 0:
+        raise ValueError("index_topk_freq must be positive")
+    if pattern is not None:
+        skip_topk = pattern[layer_id] == "S"
+        next_skip_topk = (
+            layer_id + 1 < len(pattern) and pattern[layer_id + 1] == "S"
+        )
+        return skip_topk, next_skip_topk
+    if offset is not None:
+        if offset <= 0:
+            raise ValueError("index_skip_topk_offset must be positive")
+        return (
+            max(layer_id - offset + 1, 0) % frequency != 0,
+            max(layer_id - offset + 2, 0) % frequency != 0,
+        )
+    return max(layer_id - 1, 0) % frequency != 0, layer_id % frequency != 0
+
+
 class ModelConfig:
     def __init__(
         self,

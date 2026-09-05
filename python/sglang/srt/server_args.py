@@ -1526,6 +1526,23 @@ class ServerArgs:
                         logger.warning(
                             f"Set dense attention kv len threshold to model index_topk={envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DeepSeek with DSA."
                         )
+
+                    index_topk_freq = getattr(hf_config, "index_topk_freq", 1)
+                    index_topk_pattern = getattr(
+                        hf_config, "index_topk_pattern", None
+                    )
+                    if self.enable_two_batch_overlap and (
+                        index_topk_freq > 1
+                        or (
+                            index_topk_pattern is not None
+                            and "S" in index_topk_pattern
+                        )
+                    ):
+                        raise ValueError(
+                            "--enable-two-batch-overlap is not supported with "
+                            "DSA IndexShare because top-k indices are not propagated "
+                            "between TBO operations."
+                        )
                     if self.nsa_prefill_backend == "trtllm":
                         # We temporarily set the threshold to 128k to avoid IMA error. Should be removed after supporting flashmla prefill impl with trtllm decode impl.
                         envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(

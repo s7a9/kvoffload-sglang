@@ -84,6 +84,27 @@ class DeepseekMLAForwardMixin:
             get_global_server_args().flashinfer_mla_disable_ragged
         )
 
+    def should_run_indexer(
+        self: DeepseekV2AttentionMLA,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> bool:
+        return not self.skip_topk or (
+            self.is_nextn and prev_topk_indices is None
+        )
+
+    def resolve_indexshare_topk(
+        self: DeepseekV2AttentionMLA,
+        forward_batch: ForwardBatch,
+        topk_indices: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if topk_indices is None and self.skip_topk and not self.is_nextn:
+            raise RuntimeError(
+                f"DSA IndexShare layer {self.layer_id} has no top-k indices to reuse"
+            )
+        if topk_indices is not None:
+            forward_batch.topk_indices = topk_indices
+        return topk_indices
+
     def forward_absorb_prepare(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
@@ -95,7 +116,7 @@ class DeepseekMLAForwardMixin:
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         q_lora = None
-        topk_indices = None
+        topk_indices = getattr(forward_batch, "topk_indices", None)
         if self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -182,18 +203,7 @@ class DeepseekMLAForwardMixin:
                     q = self.q_b_proj(q)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                topk_indices = self.indexer(
-                    x=hidden_states,
-                    q_lora=q_lora,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=self.layer_id,
-                )
-                current_stream.wait_stream(self.alt_stream)
-            else:
-                k_nope = k_nope.unsqueeze(1)
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-                if q_lora is not None:
+                if self.should_run_indexer(topk_indices):
                     topk_indices = self.indexer(
                         x=hidden_states,
                         q_lora=q_lora,
@@ -201,6 +211,23 @@ class DeepseekMLAForwardMixin:
                         forward_batch=forward_batch,
                         layer_id=self.layer_id,
                     )
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                k_nope = k_nope.unsqueeze(1)
+                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                if q_lora is not None and self.should_run_indexer(topk_indices):
+                    topk_indices = self.indexer(
+                        x=hidden_states,
+                        q_lora=q_lora,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        layer_id=self.layer_id,
+                    )
+
+            if self.use_nsa:
+                topk_indices = self.resolve_indexshare_topk(
+                    forward_batch, topk_indices
+                )
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
