@@ -1195,6 +1195,11 @@ class Scheduler(
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
 
+        if hasattr(self.tree_cache, "set_before_device_offload"):
+            self.tree_cache.set_before_device_offload(
+                self._wait_for_inflight_forward_before_device_offload
+            )
+
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.forward_stream
         )
@@ -1216,6 +1221,16 @@ class Scheduler(
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
+
+    def _wait_for_inflight_forward_before_device_offload(self) -> None:
+        if not self.enable_overlap:
+            return
+
+        self.device_module.current_stream().wait_stream(self.forward_stream)
+
+    def _apply_request_offload_overlap_barrier(self) -> None:
+        if getattr(self.tree_cache, "supports_request_offload", False):
+            self._wait_for_inflight_forward_before_device_offload()
 
     def maybe_init_ngram_embedding(self):
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
@@ -1443,6 +1458,10 @@ class Scheduler(
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
+
+            # SyncCache may write back or recycle cache slots while preparing
+            # the next batch. Keep those mutations behind the previous forward.
+            self._apply_request_offload_overlap_barrier()
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()

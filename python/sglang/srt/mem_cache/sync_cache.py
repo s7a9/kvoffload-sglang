@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache, TreeNode
 
@@ -39,8 +39,12 @@ class SyncCache(HiRadixCache):
             hicache_storage_backend=None,
         )
         self._req_states: Dict[str, SyncCacheReqState] = {}
+        self._before_device_offload: Optional[Callable[[], None]] = None
 
         super().__init__(params=sync_params, server_args=sync_server_args)
+
+    def set_before_device_offload(self, callback: Callable[[], None]) -> None:
+        self._before_device_offload = callback
 
     def _infer_seq_len(self, req: Req) -> int:
         committed_len = int(getattr(req, "kv_committed_len", 0))
@@ -105,6 +109,12 @@ class SyncCache(HiRadixCache):
         if target_len <= 0:
             self._req_states.pop(req.rid, None)
             return
+
+        # With overlap scheduling, the latest committed slots may still be
+        # produced by the previous forward (including a CUDA Graph replay).
+        # Order all radix/indexer reads and the HiCache write stream after it.
+        if self._before_device_offload is not None:
+            self._before_device_offload()
 
         # Ensure the latest committed KV is represented in radix before offloading.
         self._sync_req_to_radix(req, target_len)

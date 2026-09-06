@@ -75,6 +75,16 @@ if is_cuda():
 
 logger = logging.getLogger(__name__)
 
+_LARGE_HICACHE_GRAPH_LIMIT_BYTES = 1 << 32
+
+
+def _should_disable_draft_extend_graph_for_hicache(server_args: ServerArgs) -> bool:
+    hicache_size_bytes = server_args.hicache_size * 1_000_000_000
+    return (
+        server_args.enable_hierarchical_cache
+        and hicache_size_bytes > _LARGE_HICACHE_GRAPH_LIMIT_BYTES
+    )
+
 
 class EAGLEWorker(TpModelWorker):
 
@@ -257,8 +267,19 @@ class EAGLEWorker(TpModelWorker):
                 f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
 
+        # A per-rank HiCache allocation above 4 GiB reproducibly makes EAGLE
+        # draft-extend graph replay fail with an illegal memory access on CUDA.
+        # Keep target/decode graphs enabled and run only draft-extend eagerly.
+        disable_draft_extend_graph_for_hicache = (
+            _should_disable_draft_extend_graph_for_hicache(self.server_args)
+        )
+
         # Capture extend
-        if self.draft_extend_attn_backend and not _is_npu:
+        if (
+            self.draft_extend_attn_backend
+            and not _is_npu
+            and not disable_draft_extend_graph_for_hicache
+        ):
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
@@ -270,6 +291,15 @@ class EAGLEWorker(TpModelWorker):
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
+            )
+        elif (
+            self.draft_extend_attn_backend
+            and not _is_npu
+            and disable_draft_extend_graph_for_hicache
+        ):
+            logger.warning(
+                "Disable EAGLE draft-extend CUDA Graph because hierarchical "
+                "cache size exceeds 4 GiB; target/decode CUDA Graph remains enabled."
             )
 
     @property

@@ -120,9 +120,15 @@ def alloc_with_host_register(
     """
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
-        torch.cuda.cudart().cudaHostRegister(
+        cudart = torch.cuda.cudart()
+        error = cudart.cudaHostRegister(
             buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
         )
+        if error != cudart.cudaError.success:
+            raise RuntimeError(
+                "cudaHostRegister failed for HiCache host buffer "
+                f"({buffer.numel() * buffer.element_size()} bytes): {error}"
+            )
     return buffer
 
 

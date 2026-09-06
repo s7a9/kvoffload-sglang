@@ -6,7 +6,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 PORT="${PORT:-31000}"
 TAG="${TAG:-pressure-ondemand}"
-RESULT_DIR="${RESULT_DIR:-${REPO_ROOT}/kvoffload/results/glm52-16k8k-small-no-graph}"
+MODE="${MODE:-offload}"
+RESULT_DIR="${RESULT_DIR:-${REPO_ROOT}/kvoffload/results/glm52-16k8k-small-graph}"
 SERVER_LOG="${SERVER_LOG:-${RESULT_DIR}/${TAG}-server.log}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-300}"
 HEALTH_ENDPOINT_GENERATION="${HEALTH_ENDPOINT_GENERATION:-false}"
@@ -23,10 +24,10 @@ trap cleanup EXIT INT TERM
 
 cd "${REPO_ROOT}"
 SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION="${HEALTH_ENDPOINT_GENERATION}" \
-MODE=offload \
+MODE="${MODE}" \
 TAG="${TAG}" \
 PORT="${PORT}" \
-EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:---disable-cuda-graph}" \
+EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-}" \
     bash kvoffload/scripts/start_server_glm52_fp8.sh >"${SERVER_LOG}" 2>&1 &
 server_pid=$!
 
