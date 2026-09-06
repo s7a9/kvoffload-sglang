@@ -1910,6 +1910,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = list(range(len(self.reqs)))
+        request_offload = (
+            getattr(self.tree_cache, "supports_request_offload", False) is True
+            and server_args.kv_offload_enable_emergency_eviction
+        )
+        emergency_offload_attempts = 0
 
         # TODO(lsyin): improve retraction policy for radix cache
         # For spec decoding, filter_batch API can only filter
@@ -1935,7 +1940,36 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 break
 
             first_iter = False
-            idx = sorted_indices.pop()
+            if request_offload and emergency_offload_attempts < max(
+                int(server_args.kv_offload_emergency_decode_retry), 0
+            ):
+                # Decode progress is deterministic across TP ranks and is a
+                # stable proxy for runtime. Preserve list order for the kept
+                # requests while selecting the most mature request as victim.
+                idx = max(
+                    sorted_indices,
+                    key=lambda i: (
+                        len(self.reqs[i].output_ids),
+                        int(getattr(self.reqs[i], "kv_committed_len", 0)),
+                        self.reqs[i].rid,
+                    ),
+                )
+                sorted_indices.remove(idx)
+                emergency_offload_attempts += 1
+                victim = self.reqs[idx]
+                logger.info(
+                    "KV offload decode pressure: victim_rid=%s "
+                    "victim_committed=%d victim_output=%d available=%d required=%d",
+                    victim.rid,
+                    int(getattr(victim, "kv_committed_len", 0)),
+                    len(victim.output_ids),
+                    self.token_to_kv_pool_allocator.available_size(),
+                    self.new_tokens_required_next_decode(
+                        selected_indices=sorted_indices
+                    ),
+                )
+            else:
+                idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
             # release memory and don't insert into the tree because we need the space instantly

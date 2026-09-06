@@ -67,8 +67,10 @@ class TestPrefillAdder(CustomTestCase):
         )
         server_args.kv_offload_enable_emergency_eviction = False
         server_args.kv_offload_emergency_min_evict_tokens = 256
+        server_args.kv_offload_emergency_decode_retry = 1
         server_args.kv_offload_emergency_prefill_retry = 1
         server_args.kv_offload_emergency_trigger_ratio = 0.05
+        server_args.speculative_algorithm = "EAGLE"
         return server_args
 
     def create_mock_req(
@@ -92,10 +94,11 @@ class TestPrefillAdder(CustomTestCase):
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.kv_committed_len = 0
         req.is_retracted = False
+        req.host_hit_length = 0
         req.finished.return_value = False
         return req
 
-    def test_pressure_offload_selects_longest_running_request(self):
+    def test_pressure_admission_defers_output_reservation(self):
         shorter = self.create_mock_req(
             "shorter", priority=0, max_new_tokens=100, output_len=20
         )
@@ -118,16 +121,49 @@ class TestPrefillAdder(CustomTestCase):
         incoming = self.create_mock_req(
             "incoming", priority=0, max_new_tokens=400
         )
+        incoming.extend_input_len = 50
 
         self.assertTrue(
-            adder.offload_long_running_to_schedule(incoming, server_args)
+            adder.can_defer_output_reservation(incoming, server_args)
         )
-        running_batch.release_req.assert_called_once_with(1, 1, server_args)
-        running_batch.filter_batch.assert_called_once_with(keep_indices=[0])
-        self.assertEqual(adder.preempt_list, [longer])
-        self.assertEqual(adder.emergency_offload_count, 1)
+        running_batch.release_req.assert_not_called()
+        self.assertEqual(adder.deferred_output_reservation_count, 1)
 
-    def test_pressure_offload_rejects_large_admission_deficit(self):
+    def test_deferred_reservation_uses_immediate_memory_budget(self):
+        running = self.create_mock_req(
+            "running", priority=0, max_new_tokens=480
+        )
+        incoming = self.create_mock_req(
+            "incoming", priority=0, max_new_tokens=400
+        )
+        incoming.extend_input_len = 50
+        incoming.prefix_indices = []
+        incoming.fill_ids = [0] * 50
+        incoming.last_node = MagicMock()
+        self.mock_token_allocator.available_size.return_value = 500
+        adder = self.create_adder(self.create_running_batch([running]))
+
+        self.assertEqual(
+            adder.add_one_req(
+                incoming,
+                has_chunked_req=False,
+                truncation_align_size=None,
+            ),
+            AddReqResult.NO_TOKEN,
+        )
+        self.assertEqual(adder.can_run_list, [])
+
+        result = adder.add_one_req(
+            incoming,
+            has_chunked_req=False,
+            truncation_align_size=None,
+            defer_output_reservation=True,
+        )
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(adder.can_run_list, [incoming])
+
+    def test_pressure_admission_rejects_large_reservation_deficit(self):
         running = self.create_mock_req(
             "running", priority=0, max_new_tokens=100, output_len=50
         )
@@ -148,11 +184,11 @@ class TestPrefillAdder(CustomTestCase):
         )
 
         self.assertFalse(
-            adder.offload_long_running_to_schedule(incoming, server_args)
+            adder.can_defer_output_reservation(incoming, server_args)
         )
         running_batch.release_req.assert_not_called()
 
-    def test_pressure_offload_does_not_swap_retracted_request(self):
+    def test_pressure_admission_does_not_overcommit_retracted_request(self):
         running = self.create_mock_req(
             "running", priority=0, max_new_tokens=100, output_len=50
         )
@@ -174,9 +210,43 @@ class TestPrefillAdder(CustomTestCase):
         incoming.is_retracted = True
 
         self.assertFalse(
-            adder.offload_long_running_to_schedule(incoming, server_args)
+            adder.can_defer_output_reservation(incoming, server_args)
         )
         running_batch.release_req.assert_not_called()
+
+    def test_decode_pressure_offloads_most_mature_request(self):
+        newest = self.create_mock_req(
+            "newest", priority=0, max_new_tokens=100, output_len=10
+        )
+        oldest = self.create_mock_req(
+            "oldest", priority=0, max_new_tokens=100, output_len=80
+        )
+        middle = self.create_mock_req(
+            "middle", priority=0, max_new_tokens=100, output_len=40
+        )
+        oldest.kv_committed_len = 500
+
+        batch = SimpleNamespace(
+            reqs=[newest, oldest, middle],
+            tree_cache=SimpleNamespace(supports_request_offload=True),
+            token_to_kv_pool_allocator=MagicMock(),
+            check_decode_mem=MagicMock(return_value=True),
+            new_tokens_required_next_decode=MagicMock(return_value=128),
+            release_req=MagicMock(),
+            filter_batch=MagicMock(),
+        )
+        batch.token_to_kv_pool_allocator.available_size.return_value = 0
+        server_args = self.create_server_args(
+            schedule_low_priority_values_first=False
+        )
+        server_args.kv_offload_enable_emergency_eviction = True
+
+        retracted, _, aborted = ScheduleBatch.retract_decode(batch, server_args)
+
+        self.assertEqual(retracted, [oldest])
+        self.assertEqual(aborted, [])
+        batch.release_req.assert_called_once_with(1, 2, server_args)
+        batch.filter_batch.assert_called_once_with(keep_indices=[0, 2])
 
     def test_release_req_uses_request_offload_without_double_free(self):
         req = self.create_mock_req(

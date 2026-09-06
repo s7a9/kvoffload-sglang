@@ -2673,7 +2673,7 @@ class Scheduler(
                 truncation_align_size=self.truncation_align_size,
             )
 
-            if res == AddReqResult.NO_TOKEN and adder.offload_long_running_to_schedule(
+            if res == AddReqResult.NO_TOKEN and adder.can_defer_output_reservation(
                 req, self.server_args
             ):
                 req.init_next_round_input(self.tree_cache)
@@ -2681,6 +2681,7 @@ class Scheduler(
                     req,
                     has_chunked_req=(self.chunked_req is not None),
                     truncation_align_size=self.truncation_align_size,
+                    defer_output_reservation=True,
                 )
 
             if self.enable_lora:
@@ -2827,10 +2828,18 @@ class Scheduler(
                     req,
                 )
 
+            request_offload = (
+                getattr(batch.tree_cache, "supports_request_offload", False) is True
+                and self.server_args.kv_offload_enable_emergency_eviction
+            )
             msg_prefix = (
-                "KV cache pool is full. Retract requests. "
-                if kv_full_retract_flag
-                else "Testing retraction. "
+                "KV cache pool is full. Offload requests. "
+                if kv_full_retract_flag and request_offload
+                else (
+                    "KV cache pool is full. Retract requests. "
+                    if kv_full_retract_flag
+                    else "Testing retraction. "
+                )
             )
             msg_details = f"#retracted_reqs: {len(retracted_reqs)}, #new_tokens_gained: {new_token_gained}"
             if kv_full_retract_flag:

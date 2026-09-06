@@ -5318,7 +5318,7 @@ class ServerArgs:
             "--kv-offload-emergency-prefill-retry",
             type=int,
             default=ServerArgs.kv_offload_emergency_prefill_retry,
-            help="Maximum emergency eviction retries for prefill admission.",
+            help="Maximum prefill retries that may defer output-token reservation before decode-pressure offload.",
         )
         parser.add_argument(
             "--kv-offload-emergency-trigger-ratio",
